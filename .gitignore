@@ -45,3 +45,9 @@ reports/*
 
 # --- MLflow / experiment tracking (introduced Phase 8) ---
 mlruns/
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Local Claude Code files
+.claude/
