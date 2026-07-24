@@ -47,6 +47,36 @@ See
 [`docs/architecture.md`](docs/architecture.md#current-status-phase-2b-tess-fits-download-and-raw-parsing)
 for the cache design, FITS fields extracted, and known limitations.
 
+**Phase 3A: Quality and finite-value filtering** -- complete. Select the
+cadences worth analysing, by TESS quality flags and by finiteness, while
+leaving the raw file and its values untouched:
+
+```bash
+cd backend
+python -m app.cli filter-quality data/raw/tess/sector_001/<filename>.fits
+python -m app.cli filter-quality <path>.fits --quality-policy default
+python -m app.cli filter-quality <path>.fits --quality-policy custom --quality-bitmask 128
+```
+
+Quality policies (bit meanings verified against the TESS Science Data
+Products Description Document Rev F, Table 32, and MAST's Cadence
+Quality Flags table):
+
+| Policy | Mask | Meaning |
+|---|---|---|
+| `none` | 0 | Retain every cadence regardless of flags. |
+| `default` | 17087 | Lightkurve-compatible default mask. |
+| `mast` | 21183 | MAST-recommended mask (`default` plus the automatic scattered-light flag). **Used unless you request another policy.** |
+| `hard` | 24319 | Conservative; also drops cosmic-ray-corrected and stray-light cadences. |
+| `hardest` | 65535 | Any flag at all. Not recommended -- many flags mean a correction was *applied*, not that the data is bad. |
+| custom | any integer | Your own bitmask. |
+
+Every rejected cadence is recorded with its original `QUALITY` value,
+the bits that actually matched, and its reason(s); nothing is discarded
+silently. See
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-3a-quality-and-finite-value-filtering)
+for the full bit table, citations, and scientific guarantees.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -133,8 +163,9 @@ frontend independently.
 1. **Foundation & dev environment** -- done.
 2. Real TESS Data Explorer -- CLI-driven download and FITS parsing.
    - **2A: target and observation discovery** -- done.
-   - **2B: FITS download, caching, and parsing** -- done (this milestone).
+   - **2B: FITS download, caching, and parsing** -- done.
 3. Light-curve preprocessing pipeline.
+   - **3A: quality and finite-value filtering** -- done (this milestone).
 4. Transit-search engine (Box Least Squares + pluggable interface).
 5. Physical property estimation.
 6. Synthetic planetary system generator.

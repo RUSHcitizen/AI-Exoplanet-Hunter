@@ -285,6 +285,147 @@ were caught by the manually-invoked live integration test against a
 real MAST product, not by the mocked unit tests, which is exactly the
 gap that test exists to cover.
 
+## Current status: Phase 3A (Quality and finite-value filtering)
+
+This is the `Quality filtering (TESS quality flags)` stage of the data
+flow above -- the first slice of roadmap phase 3 (light-curve
+preprocessing). It *selects* cadences and never alters a value; nothing
+is normalized, detrended, sigma-clipped, smoothed, or stitched.
+
+Implemented:
+- `app/data/quality_flags.py` -- the verified TESS `QUALITY` bit table
+  and the named bitmask policies built from it, with full source
+  citations and a retrieval date. Reference data only, no logic; kept in
+  its own module so re-auditing it against a future revision of the TESS
+  data-products document is a single-file diff.
+- `app/data/quality_filter.py` -- `filter_quality(raw, config)`, a pure
+  function from a `RawLightCurve` plus a `QualityFilterConfig` to a new
+  `FilteredLightCurve`. Four independent rejection rules are evaluated
+  for *every* cadence with no short-circuiting, so a cadence with
+  several problems records all of them and the result does not depend on
+  rule ordering: nonfinite `TIME`, nonfinite flux, nonfinite flux error
+  (each individually switchable), and `quality & active_bitmask != 0`.
+- New typed models (`app/data/models.py`): `RejectionReason`,
+  `QualityFilterConfig`, `RejectedCadence`, `QualityFilterStats`,
+  `ProcessingStep`, `FilteredLightCurve`, plus
+  `config_from_policy_name` for CLI-supplied policy strings.
+- New exceptions (`app/data/exceptions.py`): `ProcessingError`,
+  `InvalidLightCurveError`, `InvalidFilterConfigError`.
+- `app/cli.py` -- a `filter-quality` command:
+
+```bash
+python -m app.cli filter-quality <path>.fits                       # mast policy (default)
+python -m app.cli filter-quality <path>.fits --quality-policy hard
+python -m app.cli filter-quality <path>.fits --quality-policy custom --quality-bitmask 128
+```
+
+  It reports the policy name *and* the resolved integer mask, retained
+  and rejected counts, a per-reason breakdown, a per-bit breakdown
+  naming each matched flag, the code version, and the source checksum.
+
+Explicitly not implemented: normalization, detrending, sigma clipping,
+smoothing, brightness-based outlier rejection, gap detection, sector
+stitching, transit search, feature extraction, machine learning,
+database persistence, or dashboard/API integration.
+
+### Why this lives in `app/data/`
+
+The milestone is named Phase 3A because the roadmap places quality
+filtering under phase 3 (light-curve preprocessing), but the module sits
+in `app/data/` beside `fits_parser.py` rather than in `app/services/`.
+That is deliberate: this step performs no value transformation -- it
+consumes a `RawLightCurve` and selects rows from it. The first stage that
+actually changes numbers (normalization) is what belongs in
+`app/services/`.
+
+### Quality-bitmask policies
+
+Bit meanings are transcribed from **Table 32** ("Data quality bits") of
+the *TESS Science Data Products Description Document*, Rev F
+(NASA/TM--20205008729, 11 September 2020), section 9, page 53, and
+cross-checked against MAST's "Cadence Quality Flags" table in
+[2.0 - Data Product Overview](https://outerspace.stsci.edu/display/TESS/2.0+-+Data+Product+Overview).
+Lightkurve's `TessQualityFlags` was used only as a secondary
+*implementation* reference for how the named masks are composed and
+applied. All three sources were retrieved on **2026-07-24** and agreed on
+every value. Note older revisions (and Lightkurve's own docstring) cite
+this as Table 28; it is Table 32 in Rev F.
+
+| Policy | Mask | Meaning |
+|---|---|---|
+| `none` | 0 | No quality filtering; every cadence retained regardless of flags. |
+| `default` | 17087 (`0x42BF`) | **Lightkurve-compatible**: exactly `TessQualityFlags.DEFAULT_BITMASK`. Bits 1, 2, 3, 4, 5, 6, 8, 10, 15. Does *not* include bit 13. |
+| `mast` | 21183 (`0x52BF`) | **MAST-recommended**: `default` plus bit 13 (Scattered Light Exclude). MAST documents it as binary `0101001010111111`. **This project's default.** |
+| `hard` | 24319 (`0x5EFF`) | `default` plus bits 7, 11, 12, 13. Conservative; Lightkurve notes it "may identify cadences which are useful", i.e. it discards some good data. |
+| `hardest` | 65535 (`0xFFFF`) | Every documented bit. **Not recommended** -- see below. |
+| custom | any `int >= 0` | Caller-supplied, applied identically via bitwise AND. |
+
+`default` and `mast` are kept as distinct names on purpose. This project
+uses **`mast`** unless the caller requests otherwise, because the parser
+prefers `PDCSAP_FLUX` and the automatic scattered-light flag marks
+cadences the pipeline itself considers degraded, so rejecting it follows
+the archive's own advice for that flux series. Calling 21183 "default"
+would wrongly imply parity with Lightkurve's current default of 17087.
+
+`hardest` rejects every cadence carrying any flag at all and should not
+be a normal choice: MAST states that "Not all of these [flags] indicate
+that the data quality is bad. In many cases the flags simply indicate
+that a correction was made" -- bit 7, for instance, means a cosmic ray
+*was corrected*, and MAST says such data "is likely fine". Lightkurve's
+source comment on the equivalent mask reads "Its use is not recommended."
+
+Source (1) also warns that the bit list is not comprehensive and that
+"it is very likely there will be changes to flag values after launch".
+The table is therefore a snapshot of Rev F, and `describe_bits` reports
+unrecognized bits explicitly rather than ignoring them.
+
+### Scientific guarantees
+
+- The input `RawLightCurve` is never mutated. It is frozen with tuple
+  fields, so this is enforced by the type rather than by convention, and
+  provenance/metadata are carried onto the result by reference.
+- `retained + rejected == total`, always. No cadence is discarded
+  without a `RejectedCadence` record naming the documented rule(s) that
+  removed it.
+- Each rejected cadence records both its **original `QUALITY` integer**
+  and the **actually matched bits** (`quality & active_bitmask`), so a
+  flag that exists but was not part of the active policy is never
+  mistaken for the cause of rejection.
+- Nonfinite values and quality flags are distinguished as separate
+  rejection reasons: a NaN means *no measurement was recorded*, while a
+  matched quality bit means *a measurement exists but the pipeline
+  flagged it*.
+- Every retained cadence keeps its original FITS row index in
+  `source_indices`, so correspondence with the source file survives
+  filtering.
+- Results are a pure function of `(raw, config)` -- `ProcessingStep`
+  carries the code version, policy, resolved mask, config, in/out
+  counts, and the source SHA-256, but deliberately **no timestamp**, so
+  reruns are reproducible byte-for-byte.
+- A flux error of exactly `0.0` is *not* treated as invalid; it is an
+  unusual but reported measurement. Negative or large flux values are
+  likewise retained -- brightness-based outlier rejection is out of
+  scope.
+- When every cadence is rejected the result is returned normally with
+  empty arrays and complete statistics rather than raising: an unusable
+  sector is a meaningful scientific outcome, and raising would discard
+  the counts explaining why. The CLI prints a prominent warning and
+  still exits 0.
+
+### Real-data sanity check
+
+Run against a real cached SPOC product (TIC 261136679 / Pi Mensae,
+sector 1, `tess2018206045859-s0001-0000000261136679-0120-s_lc.fits`,
+20,076 cadences) under the default `mast` policy: 18,264 cadences
+retained (91.0%), 1,812 rejected -- 1,797 nonfinite flux, 1,797 nonfinite
+flux error, 815 nonfinite `TIME`, and 1,812 with matched quality bits
+(mostly Earth Point 8 and Manual Exclude 128). The file's SHA-256 and
+mtime were identical before and after.
+
+That sector contains **zero** cadences with bit 4096 set, so `default`
+and `mast` retain identically on this particular file; the behavioural
+difference between them is pinned directly by unit tests instead.
+
 ## Known limitations of this milestone
 
 - The backend Docker image installs only core web-service dependencies.
@@ -305,6 +446,18 @@ gap that test exists to cover.
   fresh request with a fixed 30s timeout, with up to 3 retries and
   exponential backoff for downloads specifically (search/discovery
   calls are not retried).
+- The quality-bit table is a snapshot of Rev F of the TESS data-products
+  document (retrieved 2026-07-24). That document explicitly warns flag
+  values may change, so the table needs re-verification against future
+  revisions; it is isolated in `app/data/quality_flags.py` and pinned by
+  `tests/test_quality_flags.py` to make that a small, reviewable change.
+- Quality filtering treats cadences independently. It does not detect or
+  report the observation *gaps* that removing cadences creates -- gap
+  detection arrives with the rest of phase 3.
+- `filter_quality` holds the whole light curve and every rejection
+  record in memory (bounded by the cadence count, ~20k for a 2-minute
+  sector). Fine at single-sector scale; batch processing of many sectors
+  may want a streaming variant later.
 - `parse_light_curve` only supports the standard SPOC/TESS-SPOC
   light-curve FITS schema (a `LIGHTCURVE` extension with `TIME`,
   `QUALITY`, and `PDCSAP_FLUX`/`SAP_FLUX` columns). QLP light curves use

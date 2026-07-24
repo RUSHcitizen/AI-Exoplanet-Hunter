@@ -2,8 +2,9 @@
 
 Run with ``python -m app.cli <command> ...``. Phase 2A implements TESS
 target/observation discovery; Phase 2B adds downloading and parsing one
-selected light-curve product. No preprocessing, transit search, or ML
-happens here yet. See ``docs/architecture.md`` for the full roadmap.
+selected light-curve product; Phase 3A adds quality and finite-value
+filtering. No normalization, detrending, transit search, or ML happens
+here yet. See ``docs/architecture.md`` for the full roadmap.
 """
 
 import argparse
@@ -20,12 +21,21 @@ from app.data.exceptions import (
     FitsError,
     InvalidTargetError,
     MastServiceError,
+    ProcessingError,
     TargetNotFoundError,
 )
 from app.data.fits_parser import parse_light_curve
 from app.data.mast_client import MastClient
-from app.data.models import CachedArtifact, RawLightCurve, TargetSearchResult
+from app.data.models import (
+    CachedArtifact,
+    FilteredLightCurve,
+    RawLightCurve,
+    TargetSearchResult,
+    config_from_policy_name,
+)
 from app.data.product_selection import select_product
+from app.data.quality_filter import filter_quality
+from app.data.quality_flags import QUALITY_BIT_TABLE, QualityPolicy
 
 logger = get_logger(__name__)
 
@@ -35,6 +45,7 @@ _EXIT_INVALID_TARGET = 2
 _EXIT_SERVICE_ERROR = 3
 _EXIT_DOWNLOAD_ERROR = 4
 _EXIT_FITS_ERROR = 5
+_EXIT_PROCESSING_ERROR = 6
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -93,6 +104,46 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Summarize a downloaded TESS light-curve FITS file (descriptive only).",
     )
     inspect_parser.add_argument("fits_path", help="Path to a cached TESS light-curve FITS file.")
+
+    filter_parser = subparsers.add_parser(
+        "filter-quality",
+        help=(
+            "Filter a downloaded TESS light curve by quality flags and finite values "
+            "(selects cadences; never modifies the FITS file or its values)."
+        ),
+    )
+    filter_parser.add_argument("fits_path", help="Path to a cached TESS light-curve FITS file.")
+    filter_parser.add_argument(
+        "--quality-policy",
+        default=QualityPolicy.MAST.value,
+        choices=[policy.value for policy in QualityPolicy],
+        help=(
+            "Named quality-bitmask policy (default: mast, the MAST-recommended mask 21183). "
+            "'default' is the Lightkurve-compatible mask 17087; 'hardest' rejects every "
+            "flagged cadence and is not recommended."
+        ),
+    )
+    filter_parser.add_argument(
+        "--quality-bitmask",
+        type=int,
+        default=None,
+        help="Custom integer bitmask; requires --quality-policy custom.",
+    )
+    filter_parser.add_argument(
+        "--allow-nonfinite-time",
+        action="store_true",
+        help="Do not reject cadences whose TIME is NaN or infinite.",
+    )
+    filter_parser.add_argument(
+        "--allow-nonfinite-flux",
+        action="store_true",
+        help="Do not reject cadences whose flux is NaN or infinite.",
+    )
+    filter_parser.add_argument(
+        "--allow-nonfinite-flux-err",
+        action="store_true",
+        help="Do not reject cadences whose flux error is NaN or infinite.",
+    )
 
     return parser
 
@@ -261,6 +312,97 @@ def run_inspect_fits(fits_path: str) -> int:
     return _EXIT_OK
 
 
+def format_filter_result(filtered: FilteredLightCurve) -> str:
+    """Render a ``FilteredLightCurve`` as a human-readable report."""
+    stats = filtered.stats
+    step = filtered.history[0]
+    prov = filtered.provenance
+    lines = [
+        f"Source file:         {prov.source_filename}",
+        f"Target (TIC):        {prov.tic_id if prov.tic_id is not None else 'unknown'}",
+        f"Sector:              {prov.sector if prov.sector is not None else 'unknown'}",
+        f"Flux column:         {filtered.flux_column}",
+        f"Quality policy:      {step.quality_policy.value}",
+        f"Resolved bitmask:    {step.active_quality_bitmask} (0x{step.active_quality_bitmask:04X})",
+        f"Total cadences:      {stats.total_cadences}",
+        f"Retained cadences:   {stats.retained_cadences} ({stats.retained_fraction * 100:.1f}%)",
+        f"Rejected cadences:   {stats.rejected_cadences}",
+    ]
+
+    if stats.rejected_by_reason:
+        lines.append("")
+        lines.append("Rejections by reason (a cadence may have several):")
+        for reason, count in sorted(stats.rejected_by_reason.items()):
+            lines.append(f"  - {reason.value}: {count}")
+
+    if stats.rejected_by_quality_bit:
+        lines.append("")
+        lines.append("Matched quality bits:")
+        for bit_value, count in sorted(stats.rejected_by_quality_bit.items()):
+            meaning = QUALITY_BIT_TABLE.get(bit_value, "undocumented bit")
+            lines.append(f"  - {bit_value} ({meaning}): {count}")
+
+    if stats.retained_cadences == 0:
+        lines.append("")
+        lines.append(
+            "WARNING: every cadence was rejected. Nothing remains to analyse; "
+            "consider a less aggressive --quality-policy."
+        )
+
+    lines.extend(
+        [
+            "",
+            f"Code version:        {step.code_version}",
+            f"Source SHA-256:      {step.input_checksum_sha256}",
+            "The source FITS file was not modified.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def run_filter_quality(
+    fits_path: str,
+    *,
+    quality_policy: str = QualityPolicy.MAST.value,
+    quality_bitmask: int | None = None,
+    allow_nonfinite_time: bool = False,
+    allow_nonfinite_flux: bool = False,
+    allow_nonfinite_flux_err: bool = False,
+) -> int:
+    """Run the ``filter-quality`` command; returns a process exit code."""
+    path = Path(fits_path)
+    if not path.is_file():
+        print(f"FITS file not found: {fits_path}", file=sys.stderr)
+        return _EXIT_FITS_ERROR
+
+    try:
+        config = config_from_policy_name(
+            quality_policy,
+            custom_quality_bitmask=quality_bitmask,
+            require_finite_time=not allow_nonfinite_time,
+            require_finite_flux=not allow_nonfinite_flux,
+            require_finite_flux_err=not allow_nonfinite_flux_err,
+        )
+    except ProcessingError as exc:
+        print(f"Invalid filter configuration: {exc}", file=sys.stderr)
+        return _EXIT_PROCESSING_ERROR
+
+    try:
+        light_curve = parse_light_curve(path)
+    except FitsError as exc:
+        print(f"Invalid FITS file: {exc}", file=sys.stderr)
+        return _EXIT_FITS_ERROR
+
+    try:
+        filtered = filter_quality(light_curve, config)
+    except ProcessingError as exc:
+        print(f"Filtering error: {exc}", file=sys.stderr)
+        return _EXIT_PROCESSING_ERROR
+
+    print(format_filter_result(filtered))
+    return _EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(get_settings())
     parser = _build_parser()
@@ -279,6 +421,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.command == "inspect-fits":
         return run_inspect_fits(args.fits_path)
+    if args.command == "filter-quality":
+        return run_filter_quality(
+            args.fits_path,
+            quality_policy=args.quality_policy,
+            quality_bitmask=args.quality_bitmask,
+            allow_nonfinite_time=args.allow_nonfinite_time,
+            allow_nonfinite_flux=args.allow_nonfinite_flux,
+            allow_nonfinite_flux_err=args.allow_nonfinite_flux_err,
+        )
 
     parser.error(f"Unknown command: {args.command}")
     return _EXIT_INVALID_TARGET
