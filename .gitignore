@@ -1,0 +1,47 @@
+# --- Environment / secrets ---
+.env
+.env.local
+*.pem
+
+# --- Python (backend) ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+
+# --- Node (frontend) ---
+node_modules/
+.next/
+out/
+next-env.d.ts.bak
+coverage/
+
+# --- Data (large / generated, not source) ---
+data/raw/*
+data/processed/*
+data/synthetic/*
+data/models/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/synthetic/.gitkeep
+!data/models/.gitkeep
+
+# --- Reports (generated) ---
+reports/*
+!reports/.gitkeep
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- MLflow / experiment tracking (introduced Phase 8) ---
+mlruns/

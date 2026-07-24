@@ -1,0 +1,47 @@
+# Local hooks call the project's own venv/node_modules tools directly,
+# so pre-commit checks always use the exact same Ruff/mypy/ESLint
+# versions as `make lint` and CI -- no separate pre-commit-managed
+# environment to drift out of sync.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=5000"]
+      - id: check-merge-conflict
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check (backend)
+        entry: backend/.venv/bin/ruff check --fix
+        language: system
+        files: ^backend/
+        types: [python]
+
+      - id: ruff-format
+        name: ruff format (backend)
+        entry: backend/.venv/bin/ruff format
+        language: system
+        files: ^backend/
+        types: [python]
+
+      - id: mypy
+        name: mypy (backend)
+        entry: backend/.venv/bin/mypy
+        language: system
+        files: ^backend/app/
+        types: [python]
+        pass_filenames: false
+        args: [app]
+
+      - id: eslint
+        name: eslint (frontend)
+        entry: bash -c 'cd frontend && npm run lint'
+        language: system
+        files: ^frontend/src/
+        types_or: [ts, tsx]
+        pass_filenames: false

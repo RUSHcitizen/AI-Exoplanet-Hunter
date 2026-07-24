@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+/*
+ * Mission Control is a fixed-dark interface by design (like an actual
+ * mission control room), not a light/dark-adaptive app, so color-scheme
+ * is pinned to dark rather than following the OS preference.
+ * Palette roles below follow the project's dataviz skill reference.
+ */
+:root {
+  color-scheme: dark;
+
+  --page-plane: #0d0d0d;
+  --surface-1: #1a1a19;
+  --surface-2: #202020;
+
+  --ink-primary: #ffffff;
+  --ink-secondary: #c3c2b7;
+  --ink-muted: #898781;
+
+  --border-hairline: rgba(255, 255, 255, 0.1);
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #e66767;
+
+  --series-blue: #3987e5;
+}
+
+@theme inline {
+  --color-page-plane: var(--page-plane);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-ink-primary: var(--ink-primary);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-muted: var(--ink-muted);
+  --color-status-good: var(--status-good);
+  --color-status-warning: var(--status-warning);
+  --color-status-serious: var(--status-serious);
+  --color-status-critical: var(--status-critical);
+  --color-series-blue: var(--series-blue);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--page-plane);
+  color: var(--ink-primary);
+}
