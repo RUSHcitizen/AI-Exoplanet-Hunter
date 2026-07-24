@@ -19,6 +19,20 @@ design, data flow, and rationale behind each technology choice.
 [`docs/architecture.md`](docs/architecture.md#current-status-phase-1-foundation)
 for exactly what that includes.
 
+**Phase 2A: TESS target and observation discovery** -- complete. Search
+MAST for a target's available TESS sectors, pipeline/author, and cadence
+without downloading any FITS files:
+
+```bash
+cd backend
+python -m app.cli search-target --target "TIC 261136679"
+python -m app.cli search-target --target "Pi Mensae"
+```
+
+See
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-2a-tess-target--observation-discovery)
+for exactly what is and isn't implemented yet.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -102,8 +116,10 @@ frontend independently.
 
 ## Development roadmap
 
-1. **Foundation & dev environment** -- done (this milestone).
+1. **Foundation & dev environment** -- done.
 2. Real TESS Data Explorer -- CLI-driven download and FITS parsing.
+   - **2A: target and observation discovery** -- done (this milestone).
+   - 2B: FITS download, caching, and parsing -- not yet started.
 3. Light-curve preprocessing pipeline.
 4. Transit-search engine (Box Least Squares + pluggable interface).
 5. Physical property estimation.

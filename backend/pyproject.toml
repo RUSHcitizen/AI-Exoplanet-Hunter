@@ -17,6 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mast = [
+    "astroquery>=0.4.7",
+]
 science = [
     "numpy>=2.1",
     "scipy>=1.14",
@@ -88,5 +91,8 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 minversion = "8.0"
-addopts = "-ra -q --cov=app --cov-report=term-missing"
+addopts = "-ra -q --cov=app --cov-report=term-missing -m \"not live\""
 testpaths = ["tests"]
+markers = [
+    "live: manually-invoked test that makes a real network call to MAST (excluded by default; run with `pytest -m live`)",
+]

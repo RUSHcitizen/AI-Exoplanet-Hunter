@@ -9,7 +9,7 @@ VENV := $(BACKEND_DIR)/.venv
 
 install: ## Install backend (uv) and frontend (npm) dependencies
 	cd $(BACKEND_DIR) && uv venv --python 3.13 .venv
-	cd $(BACKEND_DIR) && . .venv/bin/activate && uv pip install -e ".[dev]"
+	cd $(BACKEND_DIR) && . .venv/bin/activate && uv pip install -e ".[dev,mast]"
 	cd $(FRONTEND_DIR) && npm install
 
 dev: ## Run backend + frontend dev servers together (Ctrl+C stops both)

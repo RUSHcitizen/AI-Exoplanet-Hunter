@@ -134,13 +134,62 @@ data access, database models, transit search, machine learning, or
 reporting. The stub packages under `backend/app/{data,database,ml,...}`
 exist so the tree is navigable, but contain no logic yet.
 
+## Current status: Phase 2A (TESS target & observation discovery)
+
+Implemented:
+- `app/data/mast_client.py` -- a typed data-acquisition module that
+  resolves a target (TIC identifier or a resolvable target name) to the
+  TESS observations MAST knows about, via astroquery's MAST interface.
+  Network access is isolated behind a `MastGateway` protocol
+  (`AstroqueryMastGateway` is the real implementation), so the business
+  logic in `MastClient` can be unit-tested with a fake gateway.
+- `app/data/models.py` -- typed Pydantic result models (`TessObservation`,
+  `TargetSearchResult`).
+- `app/data/exceptions.py` -- `InvalidTargetError`, `TargetNotFoundError`,
+  `MastServiceError`.
+- `app/cli.py` -- a `search-target` command
+  (`python -m app.cli search-target --target "TIC 261136679"`) that
+  prints resolved target identity, available sectors, mission/product
+  type, cadence, pipeline/author, and observation count.
+- A new `mast` optional dependency group (`astroquery`, pulling in
+  `astropy` transitively) -- deliberately smaller than the full `science`
+  group, since FITS parsing and preprocessing aren't in scope yet.
+- One `@pytest.mark.live` integration test
+  (`tests/test_mast_client_live.py`) that makes a real MAST request; it
+  is excluded from normal `pytest` runs (`-m "not live"` in
+  `pyproject.toml`) and must be run explicitly with `pytest -m live`.
+
+Explicitly not implemented in this milestone: downloading or caching
+FITS files, parsing light curves, quality filtering, preprocessing,
+transit search, database persistence of search results, or any
+dashboard/API integration of target search. Those remain later phases
+(see the root README's roadmap).
+
+### Data-source attribution
+
+Target and observation discovery queries NASA's Mikulski Archive for
+Space Telescopes (MAST) via [astroquery](https://astroquery.readthedocs.io/en/latest/mast/mast.html).
+TESS data products are produced by pipelines including SPOC, TESS-SPOC,
+and QLP; MAST reports which pipeline produced each product (the
+`provenance_name` column, surfaced here as "author"). No data is
+downloaded or redistributed by this milestone -- only observation
+metadata is retrieved.
+
 ## Known limitations of this milestone
 
 - The backend Docker image installs only core web-service dependencies.
-  The `science` (Astropy, Lightkurve, astroquery) and `ml` (PyTorch,
-  scikit-learn) extras are deliberately deferred to the phases that use
-  them, to avoid multi-gigabyte builds with no corresponding functionality.
+  The `mast` (astroquery), `science` (Astropy, Lightkurve, ...), and `ml`
+  (PyTorch, scikit-learn) extras are deliberately deferred to the phases
+  that use them, to avoid multi-gigabyte builds with no corresponding
+  functionality.
 - Postgres is provisioned but nothing reads from or writes to it yet --
-  database models arrive in Phase 2.
+  database models for search results arrive in a later phase.
 - The dashboard's mission-overview numbers are static placeholders; they
   become live once the pipeline starts writing to the database.
+- Name-based search relies on MAST's cone search around a resolved
+  coordinate (Sesame/Simbad name resolution via astropy), then filters
+  to the TESS mission; it can occasionally surface a full-frame-image
+  row before a target's own timeseries row, though `MastClient` prefers
+  rows with a numeric TIC ID when picking the resolved identity.
+- No caching, rate-limiting, or retry logic wraps the MAST calls yet;
+  each CLI invocation makes a fresh request with a fixed 30s timeout.
