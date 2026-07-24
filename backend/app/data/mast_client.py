@@ -193,7 +193,7 @@ class MastClient:
 
 def _row_to_observation(row: dict[str, Any]) -> TessObservation:
     return TessObservation(
-        obs_id=str(row.get("obs_id", "")),
+        obs_id=str(row.get("obsid", row.get("obs_id", ""))),
         target_name=str(row.get("target_name", "")),
         mission=str(row.get("obs_collection", "")),
         dataproduct_type=str(row.get("dataproduct_type", "")),

@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://exoplanet:exoplanet@localhost:5432/exoplanet_hunter"
 
     data_dir: str = "../data"
-    mast_cache_dir: str = "../data/raw"
+    mast_cache_dir: str = "../data/raw/tess"
 
 
 @lru_cache

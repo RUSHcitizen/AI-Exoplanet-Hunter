@@ -33,6 +33,20 @@ See
 [`docs/architecture.md`](docs/architecture.md#current-status-phase-2a-tess-target--observation-discovery)
 for exactly what is and isn't implemented yet.
 
+**Phase 2B: TESS FITS download and raw parsing** -- complete. Download
+one selected light-curve product, cache it locally with a checksum, and
+parse it into typed raw arrays (no preprocessing):
+
+```bash
+cd backend
+python -m app.cli download-target --target "TIC 261136679" --sector 1
+python -m app.cli inspect-fits data/raw/tess/sector_001/<filename>.fits
+```
+
+See
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-2b-tess-fits-download-and-raw-parsing)
+for the cache design, FITS fields extracted, and known limitations.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -118,8 +132,8 @@ frontend independently.
 
 1. **Foundation & dev environment** -- done.
 2. Real TESS Data Explorer -- CLI-driven download and FITS parsing.
-   - **2A: target and observation discovery** -- done (this milestone).
-   - 2B: FITS download, caching, and parsing -- not yet started.
+   - **2A: target and observation discovery** -- done.
+   - **2B: FITS download, caching, and parsing** -- done (this milestone).
 3. Light-curve preprocessing pipeline.
 4. Transit-search engine (Box Least Squares + pluggable interface).
 5. Physical property estimation.

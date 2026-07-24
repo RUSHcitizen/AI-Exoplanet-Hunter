@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 mast = [
     "astroquery>=0.4.7",
+    "astropy>=6.1",
 ]
 science = [
     "numpy>=2.1",

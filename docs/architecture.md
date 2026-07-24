@@ -175,10 +175,120 @@ and QLP; MAST reports which pipeline produced each product (the
 downloaded or redistributed by this milestone -- only observation
 metadata is retrieved.
 
+## Current status: Phase 2B (TESS FITS download and raw parsing)
+
+Implemented:
+- `app/data/product_selection.py` -- deterministic selection of exactly
+  one downloadable light-curve product from a target's discovered
+  observations (Phase 2A) and MAST's per-observation product list. Rules
+  (documented in the module docstring): only `timeseries` observations
+  are considered; any `--sector`/`--author`/`--cadence` filters are
+  applied; remaining observations are tried in pipeline-priority order
+  (SPOC, then TESS-SPOC, then QLP, then alphabetically); products are
+  filtered to light-curve rows (`productSubGroupDescription == "LC"`, or
+  a `_lc.fits`/`_llc.fits` filename for pipelines that don't set that
+  field); ties are broken by filename. Never picks arbitrarily among
+  ambiguous matches -- if nothing matches, it raises a clear error
+  instead.
+- `app/data/downloader.py` -- `LightCurveDownloader`, a typed, testable
+  layer that downloads one selected product and caches it locally.
+  Network access (listing an observation's products, fetching one) is
+  isolated behind a `MastProductGateway` protocol, the same pattern
+  Phase 2A uses for `MastGateway`. Downloads go to a temporary file
+  first and are only moved into place after validating size (and, if
+  MAST reported one, comparing it against the manifest); a SHA-256
+  checksum is computed and stored in a `.sha256` sidecar next to the
+  cached file so a later run can detect local corruption without
+  re-contacting MAST. Transient MAST failures are retried up to 3 times
+  with exponential backoff (1s, 2s, ...); non-network errors (invalid
+  target, no matching product) are never retried.
+- `app/data/fits_parser.py` -- `parse_light_curve`, which reads a
+  supported SPOC/TESS-SPOC light-curve FITS file (Astropy) into a typed
+  `RawLightCurve`: time, flux (preferring `PDCSAP_FLUX` over `SAP_FLUX`
+  when both are present), flux uncertainty, quality flags, cadence,
+  sector/camera/CCD, TIC ID, object name, pipeline, telescope/mission,
+  a flattened subset of the FITS header, and the source file's name and
+  SHA-256 checksum. No preprocessing happens: values are copied out
+  exactly as stored, aside from safe conversion to typed Python
+  structures -- no NaN removal, quality filtering, normalization,
+  detrending, or sector stitching.
+- `app/cli.py` -- two new commands:
+  - `download-target` (`--target`, `--sector`, `--author`, `--cadence`,
+    `--output-dir`, `--force`) resolves a target, selects one product,
+    downloads or reuses it from cache, and reports the resolved target,
+    selected product, sector, pipeline, cadence, local path, file size,
+    SHA-256 checksum, and whether it was downloaded or served from
+    cache.
+  - `inspect-fits <path>` parses a cached FITS file and prints a
+    descriptive summary (target, sector, camera/CCD, pipeline, cadence
+    count, time range, flux column used, missing-flux count, nonzero-
+    quality-flag count, cadence, file size, checksum) without modifying
+    the data.
+- New exceptions (`app/data/exceptions.py`): `DownloadError`,
+  `RetryExhaustedError`, `ChecksumMismatchError`, `CorruptedCacheError`
+  (download/cache), and `FitsError`, `InvalidFitsError`,
+  `UnsupportedProductError`, `MissingExtensionError`,
+  `MissingColumnError` (FITS parsing).
+- New typed models (`app/data/models.py`): `DownloadRequest`,
+  `SelectedProduct`, `CachedArtifact`, `FileProvenance`, `FitsMetadata`,
+  `RawLightCurve`.
+- `astropy` added as an explicit direct dependency of the `mast` extra
+  (previously only pulled in transitively via astroquery), since this
+  phase imports `astropy.io.fits` directly.
+- One additional `@pytest.mark.live` test
+  (`tests/test_download_live.py`) that downloads and parses one real
+  light-curve product to a temporary directory (cleaned up afterward);
+  excluded from normal runs like Phase 2A's live search test.
+
+Explicitly not implemented in this milestone: quality-flag filtering,
+NaN handling, normalization, detrending, sector stitching, transit
+search, feature extraction, machine learning, database persistence, or
+any dashboard/API integration. Those remain later phases.
+
+### Cache design
+
+Downloaded FITS files are cached under `data/raw/tess/` (configurable
+via `--output-dir` or the `mast_cache_dir` setting), laid out as:
+
+```text
+data/raw/tess/sector_<NNN>/<original MAST filename>
+data/raw/tess/sector_<NNN>/<original MAST filename>.sha256
+```
+
+The sector subdirectory keeps the cache path deterministic given only a
+product's identity (sector, filename). Re-running `download-target`
+against an existing valid cache entry reuses it without contacting MAST;
+`--force` is required to replace an existing entry (valid or not). If a
+cached file's contents no longer match its `.sha256` sidecar (e.g. from
+manual editing or disk corruption), the command reports a clear
+`CorruptedCacheError` and refuses to silently reuse it. To clear a
+cached file safely, delete both the FITS file and its `.sha256` sidecar
+(or delete the whole `data/raw/tess/` directory) and re-run
+`download-target`.
+
+### Known limitation discovered while implementing this phase
+
+MAST's `Observations.get_product_list` requires the *numeric* internal
+observation ID (`obsid`), not the human-readable `obs_id` string
+(e.g. `tess2018206045859-s0001-0000000261136679-0120-s`) that Phase 2A
+surfaces in its search-target report; using the string form fails with
+a server-side type-conversion error. `MastClient._row_to_observation`
+now prefers the numeric `obsid` column when present (real MAST rows
+always have both), falling back to `obs_id` only for the synthetic rows
+used in Phase 2A's mocked unit tests. Similarly, a light-curve FITS
+file's `TIMESYS`/`TIMEDEL` keywords live in the `LIGHTCURVE` extension
+header, not the primary header, and the primary header's `ORIGIN`
+keyword names the *institution* that produced the file ("NASA/Ames"),
+not the pipeline -- the pipeline name is derived from the `PROCVER`
+keyword instead (e.g. `"spoc-5.0.10-20200904"` -> `"SPOC"`). All three
+were caught by the manually-invoked live integration test against a
+real MAST product, not by the mocked unit tests, which is exactly the
+gap that test exists to cover.
+
 ## Known limitations of this milestone
 
 - The backend Docker image installs only core web-service dependencies.
-  The `mast` (astroquery), `science` (Astropy, Lightkurve, ...), and `ml`
+  The `mast` (astroquery, astropy), `science` (Lightkurve, ...), and `ml`
   (PyTorch, scikit-learn) extras are deliberately deferred to the phases
   that use them, to avoid multi-gigabyte builds with no corresponding
   functionality.
@@ -191,5 +301,17 @@ metadata is retrieved.
   to the TESS mission; it can occasionally surface a full-frame-image
   row before a target's own timeseries row, though `MastClient` prefers
   rows with a numeric TIC ID when picking the resolved identity.
-- No caching, rate-limiting, or retry logic wraps the MAST calls yet;
-  each CLI invocation makes a fresh request with a fixed 30s timeout.
+- No rate-limiting wraps the MAST calls; each CLI invocation makes a
+  fresh request with a fixed 30s timeout, with up to 3 retries and
+  exponential backoff for downloads specifically (search/discovery
+  calls are not retried).
+- `parse_light_curve` only supports the standard SPOC/TESS-SPOC
+  light-curve FITS schema (a `LIGHTCURVE` extension with `TIME`,
+  `QUALITY`, and `PDCSAP_FLUX`/`SAP_FLUX` columns). QLP light curves use
+  a different column schema and are rejected with a clear
+  `MissingExtensionError` rather than parsed incorrectly.
+- The download size/checksum check compares against MAST's reported
+  product size when available; MAST does not publish a per-product
+  checksum, so integrity beyond size comparison relies on the locally
+  computed SHA-256 sidecar detecting *later* corruption, not validating
+  the transfer against an independent source checksum.

@@ -5,11 +5,22 @@ injected fake ``MastClient`` (or a monkeypatched ``run_search_target``),
 so no network access or real astroquery calls happen here.
 """
 
+from pathlib import Path
+from typing import Any
+
+import numpy as np
 import pytest
+from astropy.io import fits
 
 from app import cli
-from app.data.exceptions import InvalidTargetError, MastServiceError, TargetNotFoundError
-from app.data.models import TargetSearchResult, TessObservation
+from app.data.exceptions import (
+    DownloadError,
+    InvalidTargetError,
+    MastServiceError,
+    RetryExhaustedError,
+    TargetNotFoundError,
+)
+from app.data.models import CachedArtifact, SelectedProduct, TargetSearchResult, TessObservation
 
 
 class FakeClient:
@@ -110,3 +121,288 @@ def test_main_dispatches_search_target_with_parsed_argument(
 def test_main_requires_target_argument() -> None:
     with pytest.raises(SystemExit):
         cli.main(["search-target"])
+
+
+class FakeDownloader:
+    def __init__(
+        self,
+        products: list[dict[str, Any]] | None = None,
+        artifact: CachedArtifact | None = None,
+        download_error: Exception | None = None,
+    ) -> None:
+        self.products = products or []
+        self.artifact = artifact
+        self.download_error = download_error
+        self.download_calls: list[tuple[SelectedProduct, bool]] = []
+
+    def list_products(self, obs_id: str) -> list[dict[str, Any]]:
+        return self.products
+
+    def download(self, product: SelectedProduct, *, force: bool = False) -> CachedArtifact:
+        self.download_calls.append((product, force))
+        if self.download_error is not None:
+            raise self.download_error
+        assert self.artifact is not None
+        return self.artifact
+
+
+def _sample_download_search_result() -> TargetSearchResult:
+    return TargetSearchResult(
+        query="TIC 261136679",
+        resolved_target="TIC 261136679",
+        tic_id=261136679,
+        observations=(
+            TessObservation(
+                obs_id="obs-1",
+                target_name="261136679",
+                mission="TESS",
+                dataproduct_type="timeseries",
+                sector=1,
+                author="SPOC",
+                cadence_seconds=120.0,
+                calib_level=3,
+            ),
+        ),
+    )
+
+
+def _sample_selected_product() -> SelectedProduct:
+    return SelectedProduct(
+        obs_id="obs-1",
+        tic_id=261136679,
+        sector=1,
+        author="SPOC",
+        cadence_seconds=120.0,
+        filename="tess-s0001-lc.fits",
+        data_uri="mast:TESS/product/tess-s0001-lc.fits",
+        size_bytes=100,
+        description="Light curves",
+    )
+
+
+def _sample_lc_product_row() -> dict[str, Any]:
+    return {
+        "productFilename": "tess-s0001-lc.fits",
+        "productSubGroupDescription": "LC",
+        "dataURI": "mast:TESS/product/tess-s0001-lc.fits",
+        "size": 100,
+        "description": "Light curves",
+    }
+
+
+def test_run_download_target_success_prints_report(capsys: pytest.CaptureFixture[str]) -> None:
+    artifact = CachedArtifact(
+        product=_sample_selected_product(),
+        local_path="/tmp/cache/sector_001/tess-s0001-lc.fits",
+        size_bytes=100,
+        sha256="deadbeef",
+        was_downloaded=True,
+    )
+    downloader = FakeDownloader(products=[_sample_lc_product_row()], artifact=artifact)
+
+    exit_code = cli.run_download_target(
+        "TIC 261136679",
+        client=FakeClient(result=_sample_download_search_result()),
+        downloader=downloader,
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Selected product: tess-s0001-lc.fits" in out
+    assert "Source:           downloaded" in out
+    assert "SHA-256:          deadbeef" in out
+
+
+def test_run_download_target_invalid_target_returns_exit_code_2(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = cli.run_download_target(
+        "???",
+        client=FakeClient(error=InvalidTargetError("bad target")),
+        downloader=FakeDownloader(),
+    )
+
+    assert exit_code == 2
+    assert "Invalid target: bad target" in capsys.readouterr().err
+
+
+def test_run_download_target_search_not_found_returns_exit_code_1(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = cli.run_download_target(
+        "TIC 1",
+        client=FakeClient(error=TargetNotFoundError("no observations")),
+        downloader=FakeDownloader(),
+    )
+
+    assert exit_code == 1
+    assert "Target not found: no observations" in capsys.readouterr().err
+
+
+def test_run_download_target_search_service_error_returns_exit_code_3(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = cli.run_download_target(
+        "TIC 1", client=FakeClient(error=MastServiceError("timed out")), downloader=FakeDownloader()
+    )
+
+    assert exit_code == 3
+    assert "MAST service error: timed out" in capsys.readouterr().err
+
+
+def test_run_download_target_no_matching_product_returns_exit_code_1(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    downloader = FakeDownloader(products=[])  # no light-curve products at all
+
+    exit_code = cli.run_download_target(
+        "TIC 261136679",
+        client=FakeClient(result=_sample_download_search_result()),
+        downloader=downloader,
+    )
+
+    assert exit_code == 1
+    assert "Target not found" in capsys.readouterr().err
+
+
+def test_run_download_target_download_error_returns_exit_code_4(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    downloader = FakeDownloader(
+        products=[_sample_lc_product_row()],
+        download_error=RetryExhaustedError("network kept failing"),
+    )
+
+    exit_code = cli.run_download_target(
+        "TIC 261136679",
+        client=FakeClient(result=_sample_download_search_result()),
+        downloader=downloader,
+    )
+
+    assert exit_code == 4
+    assert "Download error: network kept failing" in capsys.readouterr().err
+
+
+def test_run_download_target_download_error_base_class_also_caught(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    downloader = FakeDownloader(
+        products=[_sample_lc_product_row()], download_error=DownloadError("boom")
+    )
+
+    exit_code = cli.run_download_target(
+        "TIC 261136679",
+        client=FakeClient(result=_sample_download_search_result()),
+        downloader=downloader,
+    )
+
+    assert exit_code == 4
+
+
+def _make_light_curve_fits(path: Path) -> Path:
+    primary = fits.PrimaryHDU()
+    primary.header["TELESCOP"] = "TESS"
+    primary.header["TICID"] = 261136679
+    primary.header["SECTOR"] = 1
+    primary.header["CAMERA"] = 2
+    primary.header["CCD"] = 3
+    primary.header["ORIGIN"] = "NASA/Ames"
+    primary.header["PROCVER"] = "spoc-5.0.10-20200904"
+    primary.header["OBJECT"] = "TIC 261136679"
+
+    columns = [
+        fits.Column(name="TIME", format="D", array=np.arange(5, dtype=np.float64)),
+        fits.Column(name="QUALITY", format="J", array=np.zeros(5, dtype=np.int32)),
+        fits.Column(name="PDCSAP_FLUX", format="D", array=np.full(5, 100.0, dtype=np.float64)),
+        fits.Column(name="PDCSAP_FLUX_ERR", format="D", array=np.full(5, 1.0, dtype=np.float64)),
+    ]
+    lc_hdu = fits.BinTableHDU.from_columns(columns, name="LIGHTCURVE")
+    lc_hdu.header["TIMESYS"] = "TDB"
+    lc_hdu.header["TIMEDEL"] = 120.0 / 86400.0
+    fits.HDUList([primary, lc_hdu]).writeto(path)
+    return path
+
+
+def test_run_inspect_fits_success_prints_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _make_light_curve_fits(tmp_path / "test-lc.fits")
+
+    exit_code = cli.run_inspect_fits(str(path))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Target (TIC):        261136679" in out
+    assert "Sector:              1" in out
+    assert "Cadences:            5" in out
+    assert "Flux column:         PDCSAP_FLUX" in out
+
+
+def test_run_inspect_fits_missing_file_returns_exit_code_5(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = cli.run_inspect_fits(str(tmp_path / "does-not-exist.fits"))
+
+    assert exit_code == 5
+    assert "FITS file not found" in capsys.readouterr().err
+
+
+def test_run_inspect_fits_invalid_file_returns_exit_code_5(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_path = tmp_path / "bad.fits"
+    bad_path.write_bytes(b"not a fits file")
+
+    exit_code = cli.run_inspect_fits(str(bad_path))
+
+    assert exit_code == 5
+    assert "Invalid FITS file" in capsys.readouterr().err
+
+
+def test_main_dispatches_download_target_with_parsed_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_download_target(target: str, **kwargs: Any) -> int:
+        captured["target"] = target
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(cli, "run_download_target", fake_run_download_target)
+
+    exit_code = cli.main(
+        [
+            "download-target",
+            "--target",
+            "TIC 261136679",
+            "--sector",
+            "1",
+            "--author",
+            "SPOC",
+            "--force",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["target"] == "TIC 261136679"
+    assert captured["kwargs"]["sector"] == 1
+    assert captured["kwargs"]["author"] == "SPOC"
+    assert captured["kwargs"]["force"] is True
+
+
+def test_main_dispatches_inspect_fits_with_parsed_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run_inspect_fits(fits_path: str) -> int:
+        captured["fits_path"] = fits_path
+        return 0
+
+    monkeypatch.setattr(cli, "run_inspect_fits", fake_run_inspect_fits)
+
+    exit_code = cli.main(["inspect-fits", "data/raw/tess/sample.fits"])
+
+    assert exit_code == 0
+    assert captured["fits_path"] == "data/raw/tess/sample.fits"
