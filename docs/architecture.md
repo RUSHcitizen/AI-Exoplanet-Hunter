@@ -24,7 +24,9 @@ FITS-file parser (Astropy)
         |
 Quality filtering (TESS quality flags)
         |
-Light-curve preprocessing (normalization, sigma clipping, gap detection)
+Gap detection and contiguous segmentation (TIME discontinuities)
+        |
+Light-curve preprocessing (normalization, sigma clipping)
         |
 Detrending (median / Savitzky-Golay / spline / custom)
         |
@@ -426,6 +428,172 @@ That sector contains **zero** cadences with bit 4096 set, so `default`
 and `mast` retain identically on this particular file; the behavioural
 difference between them is pinned directly by unit tests instead.
 
+## Current status: Phase 3B (Gap detection and contiguous light-curve segmentation)
+
+This is the `Gap detection and contiguous segmentation` stage of the
+data flow above -- the second slice of roadmap phase 3. It takes an
+already quality-filtered `FilteredLightCurve` and *selects and groups*
+its retained cadences at every TIME discontinuity large enough to be a
+meaningful gap; no value is ever changed, invented, or interpolated.
+Normalization, detrending, sigma clipping, smoothing, gap filling, and
+sector stitching all remain out of scope for later phases.
+
+Implemented:
+- `app/data/gap_segmentation.py` -- `segment_light_curve(filtered, config)`,
+  a pure function from a `FilteredLightCurve` plus a `GapDetectionConfig`
+  to a new `SegmentedLightCurve`.
+- New typed models (`app/data/models.py`): `GapDetectionConfig`,
+  `GapReason`, `DetectedGap`, `LightCurveSegment`, `SegmentationStats`,
+  `GapDetectionStep`, `SegmentedLightCurve`.
+- New exceptions (`app/data/exceptions.py`): `GapSegmentationError`,
+  `InvalidGapDetectionConfigError`, `NonFiniteTimeError`,
+  `NonMonotonicTimeError`.
+- `app/cli.py` -- a `segment-light-curve` command that filters by quality
+  and then segments in one step:
+
+```bash
+python -m app.cli segment-light-curve <path>.fits                                  # mast policy, default gap config
+python -m app.cli segment-light-curve <path>.fits --gap-multiplier 3.0 --gap-tolerance 0.001
+python -m app.cli segment-light-curve <path>.fits --quality-policy hard --missing-cadence-residual-tolerance 0.1
+```
+
+  It reports total retained cadences, segment and gap counts, measured
+  vs. metadata cadence agreement, per-segment position/source-index/time
+  ranges, per-gap boundaries/reasons/estimates, the code version, and the
+  source checksum.
+
+Explicitly not implemented: normalization, detrending, sigma clipping,
+smoothing, brightness-based outlier rejection, sector stitching, transit
+search, feature extraction, machine learning, database persistence, or
+dashboard/API integration.
+
+### Nominal cadence estimation
+
+The nominal cadence is the **median** of every consecutive, strictly
+positive TIME difference -- a robust statistic, resistant to the handful
+of outlying intervals a real gap produces (a mean would be skewed
+upward by every gap it is supposed to detect). It is estimable whenever
+at least two retained cadences exist (duplicate and decreasing TIME
+values are rejected before this step runs, guaranteeing every
+difference computed is strictly positive), and is `None` -- not an
+error -- when fewer than two cadences remain.
+
+The FITS metadata cadence (`TIMEDEL`, when present) is recorded
+alongside the measured cadence, and whether the two agree within
+`GapDetectionConfig.cadence_disagreement_fraction` (default `0.01`,
+i.e. 1%) is reported in `SegmentationStats.cadence_sources_agree`.
+**Metadata never drives gap detection and never overrides a measured
+disagreement**: thresholding always uses the measured cadence, because
+it reflects this file's own actual TIME sampling, while the metadata
+value is a single per-file header constant. A zero or missing metadata
+cadence is treated as unavailable (`cadence_sources_agree=None`), not
+as a disagreement.
+
+### The gap rule
+
+An interval between two consecutive retained cadences is a gap when::
+
+```
+actual_interval > nominal_cadence * gap_multiplier + gap_tolerance
+```
+
+Defaults (`GapDetectionConfig`): `gap_multiplier=5.0`,
+`gap_tolerance=1e-6` (days), `cadence_disagreement_fraction=0.01`,
+`missing_cadence_residual_tolerance=0.25`. `gap_multiplier` must exceed
+`1.0` (otherwise every ordinary cadence step would qualify as a gap);
+`gap_tolerance` exists specifically so ordinary floating-point cadence
+jitter is never misclassified as a gap. Both -- along with the
+disagreement fraction and missing-cadence residual tolerance -- are
+configurable via the CLI or `GapDetectionConfig` directly.
+
+### Gap-origin classification
+
+Classification uses only `source_indices` (each retained cadence's row
+index in the original FITS table) and the retained TIME values --
+nothing is inferred beyond what those two arrays can prove:
+
+- **`skipped_source_rows == 0`** (the two retained cadences were
+  adjacent in the original FITS table): the time jump was already
+  present between neighbouring source rows, so the gap is a genuine
+  interruption in the observation itself (a downlink or safe-mode
+  event, for example). Reason: `observation_gap`.
+- **`skipped_source_rows > 0`**: an earlier step (typically Phase 3A's
+  quality filter) removed one or more rows in between. Reason:
+  `source_rows_rejected`. If the actual interval still exceeds what
+  those skipped rows alone would account for at the nominal cadence
+  (beyond `gap_tolerance`), the gap *also* carries `observation_gap`:
+  the skipped rows explain part of the interval, but not all of it.
+
+A gap can therefore carry one or both reasons; it never carries neither.
+
+### Missing-cadence estimation
+
+`DetectedGap.estimated_missing_cadences` is
+`round(actual_interval / nominal_cadence) - 1` (floored at zero),
+reported only when that ratio is within
+`GapDetectionConfig.missing_cadence_residual_tolerance` of a whole
+number. An interval that doesn't land close to an integer multiple of
+the nominal cadence gets `None` instead of a falsely precise guess.
+
+### Duplicate, decreasing, and nonfinite TIME
+
+Gap detection never silently repairs measurements. A duplicate or
+decreasing consecutive TIME value raises `NonMonotonicTimeError`; a
+nonfinite (NaN or +/-inf) retained TIME value raises
+`NonFiniteTimeError` (Phase 3A's default configuration already removes
+these, so this only fires if quality filtering was run with
+`require_finite_time=False`, or a `FilteredLightCurve` was constructed
+directly). Neither condition is sorted, deduplicated, or discarded
+automatically.
+
+### Edge cases
+
+- **No gaps**: one segment containing every retained cadence.
+- **Zero retained cadences**: zero segments, zero gaps,
+  `measured_nominal_cadence=None`. Not an error.
+- **One retained cadence**: one one-cadence segment,
+  `measured_nominal_cadence=None` (nothing to estimate cadence from).
+- **Every interval exceeding the threshold**: one single-cadence
+  segment per retained cadence, with a gap between every consecutive
+  pair.
+
+### Scientific guarantees
+
+- The input `FilteredLightCurve` is never mutated. It is frozen with
+  tuple fields, so this is enforced by the type rather than by
+  convention.
+- Every retained cadence appears in exactly one segment; none are lost
+  or duplicated, and segment order matches input (TIME) order.
+- Results are a pure function of `(filtered, config)` --
+  `GapDetectionStep` carries the code version, config, in/out counts,
+  and the source SHA-256, but deliberately **no timestamp**, so reruns
+  are reproducible byte-for-byte (verified with `model_dump_json()`
+  equality in both the unit tests and the real-data check below).
+- `history` carries forward every prior processing step (e.g. Phase
+  3A's `ProcessingStep`) plus this phase's own `GapDetectionStep`, so
+  full provenance survives segmentation.
+
+### Real-data sanity check
+
+Run `segment-light-curve` (default `mast` quality policy, default gap
+config) against the same cached SPOC product as the Phase 3A check (TIC
+261136679 / Pi Mensae, sector 1, 18,264 quality-retained cadences): the
+measured nominal cadence (0.00138887 d, ~120.00 s) agreed with the FITS
+metadata cadence (~120.00 s) to within the default 1% tolerance. The
+light curve split into **46 segments** and **45 gaps**, every one
+classified `source_rows_rejected` -- including the widest gap, a
+~1.13-day interval fully attributable to 816 rows Phase 3A had already
+removed there, with no additional `observation_gap` interruption on top
+(its excess over the skipped-rows-only expectation was within
+`gap_tolerance`). A total of 1,489 missing cadences were estimated
+across the gaps where the interval was defensibly close to an integer
+cadence multiple. The file's SHA-256, size, and mtime were identical
+before and after. Repeated runs on the same input produced
+byte-identical `model_dump_json()` output, every retained
+TIME/source-index round-tripped through the segments in order with no
+omission or duplication, and the `FilteredLightCurve` input was
+confirmed unchanged by `model_dump()` equality.
+
 ## Known limitations of this milestone
 
 - The backend Docker image installs only core web-service dependencies.
@@ -451,13 +619,26 @@ difference between them is pinned directly by unit tests instead.
   values may change, so the table needs re-verification against future
   revisions; it is isolated in `app/data/quality_flags.py` and pinned by
   `tests/test_quality_flags.py` to make that a small, reviewable change.
-- Quality filtering treats cadences independently. It does not detect or
-  report the observation *gaps* that removing cadences creates -- gap
-  detection arrives with the rest of phase 3.
 - `filter_quality` holds the whole light curve and every rejection
   record in memory (bounded by the cadence count, ~20k for a 2-minute
   sector). Fine at single-sector scale; batch processing of many sectors
   may want a streaming variant later.
+- Gap-origin classification (`observation_gap` vs. `source_rows_rejected`)
+  is derived only from `source_indices` and TIME; it cannot distinguish
+  *which* Phase 3A rejection rule(s) caused skipped rows, or whether a
+  claimed `observation_gap` was a downlink, safe mode, momentum-dump, or
+  some other real interruption -- it only proves the interval was not
+  (fully) explained by rows an earlier step removed.
+- `estimated_missing_cadences` is a count derived from timing alone, not
+  a claim about *which* cadences are missing or why; it is withheld
+  (`None`) whenever the interval isn't close enough to an integer
+  cadence multiple to avoid false precision, and no attempt is made to
+  reconstruct or interpolate the missing values themselves.
+- The gap threshold uses one single measured nominal cadence for the
+  entire file. A light curve whose true cadence changes partway through
+  (e.g. a mid-sector pipeline reprocessing) is not currently detected as
+  such -- it would show up only indirectly, as apparent gaps or unusual
+  `interval_to_cadence_ratio` values.
 - `parse_light_curve` only supports the standard SPOC/TESS-SPOC
   light-curve FITS schema (a `LIGHTCURVE` extension with `TIME`,
   `QUALITY`, and `PDCSAP_FLUX`/`SAP_FLUX` columns). QLP light curves use

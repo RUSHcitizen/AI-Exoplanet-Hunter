@@ -91,3 +91,31 @@ class InvalidFilterConfigError(ProcessingError):
     Deliberately not a subclass of ``ValueError``: Pydantic v2 lets it
     propagate out of a model validator unchanged instead of rewrapping
     it as a ``ValidationError``, so callers see one consistent type."""
+
+
+class GapSegmentationError(ProcessingError):
+    """Base class for errors raised while detecting gaps in, and
+    segmenting, an already quality-filtered light curve (Phase 3B)."""
+
+
+class InvalidGapDetectionConfigError(GapSegmentationError):
+    """The supplied ``GapDetectionConfig`` is not usable (a gap multiplier
+    that would classify every interval as a gap, a negative tolerance,
+    etc.)."""
+
+
+class NonFiniteTimeError(GapSegmentationError):
+    """The input light curve contains a nonfinite (NaN or +/-inf) TIME
+    value. Gap detection cannot compute a time interval against a
+    nonfinite value; Phase 3A's default configuration already removes
+    these, so this indicates the light curve was filtered with
+    ``require_finite_time=False`` or was constructed directly."""
+
+
+class NonMonotonicTimeError(GapSegmentationError):
+    """The input light curve's TIME values are not strictly increasing --
+    a duplicate or decreasing consecutive TIME value was found.
+
+    Phase 3B never reorders, deduplicates, or otherwise silently repairs
+    measurements; a non-monotonic TIME sequence is reported as an error
+    instead."""

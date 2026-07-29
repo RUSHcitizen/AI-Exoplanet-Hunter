@@ -6,7 +6,7 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from app.data.exceptions import InvalidFilterConfigError
+from app.data.exceptions import InvalidFilterConfigError, InvalidGapDetectionConfigError
 from app.data.quality_flags import (
     POLICY_BITMASKS,
     PROJECT_DEFAULT_POLICY,
@@ -351,3 +351,248 @@ class FilteredLightCurve(BaseModel):
     @property
     def cadence_count(self) -> int:
         return len(self.time)
+
+
+class GapDetectionConfig(BaseModel):
+    """Configuration for one gap-detection and segmentation run (Phase 3B).
+
+    Units: every duration here (``gap_tolerance`` and all values derived
+    from it) is in the same unit as ``FilteredLightCurve.time`` -- TESS
+    BJD **days**, per ``app.data.fits_parser``: the FITS ``TIMEDEL``
+    keyword is read in days and only ``FitsMetadata.cadence_seconds`` is
+    ever converted to seconds, for display. ``gap_segmentation`` converts
+    that seconds value back to days internally to compare it with the
+    measured (day-native) cadence; nothing here is expressed in seconds.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    gap_multiplier: float = 5.0
+    """A cadence-to-cadence interval strictly greater than
+    ``nominal_cadence * gap_multiplier + gap_tolerance`` is classified as
+    a gap. Must exceed 1.0, or every ordinary cadence step would qualify."""
+    gap_tolerance: float = 1e-6
+    """Small absolute floating-point tolerance (in days) added to the gap
+    threshold so ordinary cadence jitter is never misclassified as a gap.
+    Also used, unscaled, as the tolerance for judging whether a gap's
+    excess interval implies an additional observation interruption beyond
+    what skipped source rows alone would explain (see
+    ``GapReason.OBSERVATION_GAP``)."""
+    cadence_disagreement_fraction: float = 0.01
+    """Fractional difference above which the measured nominal cadence and
+    the FITS metadata cadence are flagged as disagreeing in
+    ``SegmentationStats.cadence_sources_agree``. Purely informational --
+    metadata never overrides or suppresses a measured disagreement (see
+    module docstring)."""
+    missing_cadence_residual_tolerance: float = 0.25
+    """How close ``actual_interval / nominal_cadence`` must be to a whole
+    number (as a fraction of one cadence) before ``DetectedGap`` reports
+    an ``estimated_missing_cadences`` count at all. Keeps the estimate
+    from claiming false precision on an interval that is not close to an
+    integer multiple of the nominal cadence. Must be in ``(0, 0.5)``."""
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.gap_multiplier <= 1.0:
+            raise InvalidGapDetectionConfigError(
+                f"gap_multiplier must be > 1.0, got {self.gap_multiplier}."
+            )
+        if self.gap_tolerance < 0:
+            raise InvalidGapDetectionConfigError(
+                f"gap_tolerance must be >= 0, got {self.gap_tolerance}."
+            )
+        if not 0 < self.cadence_disagreement_fraction < 1:
+            raise InvalidGapDetectionConfigError(
+                "cadence_disagreement_fraction must be in (0, 1), got "
+                f"{self.cadence_disagreement_fraction}."
+            )
+        if not 0 < self.missing_cadence_residual_tolerance < 0.5:
+            raise InvalidGapDetectionConfigError(
+                "missing_cadence_residual_tolerance must be in (0, 0.5), got "
+                f"{self.missing_cadence_residual_tolerance}."
+            )
+        return self
+
+
+class GapReason(StrEnum):
+    """Why a detected gap is believed to have occurred, derived only from
+    ``FilteredLightCurve.source_indices`` and the retained TIME values --
+    never inferred beyond what those two arrays can prove.
+
+    A gap may carry both reasons at once (see
+    ``app.data.gap_segmentation`` for exactly when).
+    """
+
+    OBSERVATION_GAP = "observation_gap"
+    """The interval is not (fully) explained by rows an earlier step
+    removed: either no source rows were skipped at all (the two retained
+    cadences are adjacent in the original FITS table, so the time jump
+    was already present between neighbouring source rows -- a genuine
+    interruption in the observation itself, e.g. a downlink or safe-mode
+    event), or rows were skipped but the interval still exceeds what
+    those skipped rows alone would account for at the nominal cadence."""
+    SOURCE_ROWS_REJECTED = "source_rows_rejected"
+    """One or more original FITS rows between these two retained cadences
+    were removed by an earlier processing step (their ``source_indices``
+    are not adjacent), so at least part of the interval is attributable
+    to filtering rather than to the telescope itself."""
+
+
+class DetectedGap(BaseModel):
+    """One interval between consecutive retained cadences that exceeded
+    the configured gap threshold."""
+
+    model_config = ConfigDict(frozen=True)
+
+    before_position: int
+    """Index into the input ``FilteredLightCurve``'s retained arrays of
+    the cadence immediately before the gap."""
+    after_position: int
+    """Index into the input ``FilteredLightCurve``'s retained arrays of
+    the cadence immediately after the gap. Always ``before_position + 1``."""
+    before_source_index: int
+    """Original FITS row index of the cadence immediately before the gap."""
+    after_source_index: int
+    """Original FITS row index of the cadence immediately after the gap."""
+    time_before: float
+    time_after: float
+    actual_interval: float
+    """``time_after - time_before``, in days."""
+    nominal_cadence: float
+    """The measured nominal cadence used to evaluate this gap, in days."""
+    threshold: float
+    """``nominal_cadence * gap_multiplier + gap_tolerance`` -- the exact
+    value ``actual_interval`` was compared against."""
+    interval_to_cadence_ratio: float
+    """``actual_interval / nominal_cadence``."""
+    reasons: tuple[GapReason, ...]
+    """Non-empty, in a fixed order (``SOURCE_ROWS_REJECTED`` before
+    ``OBSERVATION_GAP`` when both apply)."""
+    skipped_source_rows: int
+    """``after_source_index - before_source_index - 1``: FITS rows an
+    earlier step removed between these two retained cadences. Zero when
+    the two cadences were adjacent in the source file."""
+    estimated_missing_cadences: int | None
+    """``round(actual_interval / nominal_cadence) - 1``, floored at zero,
+    reported only when that ratio is within
+    ``GapDetectionConfig.missing_cadence_residual_tolerance`` of a whole
+    number; ``None`` when the interval is not close enough to an integer
+    multiple of the nominal cadence to avoid false precision."""
+
+
+class LightCurveSegment(BaseModel):
+    """One maximal run of consecutive retained cadences with no detected
+    gap between any of them. Values are copies of the input
+    ``FilteredLightCurve``'s retained arrays -- no arithmetic of any kind
+    is applied."""
+
+    model_config = ConfigDict(frozen=True)
+
+    segment_number: int
+    """1-indexed position of this segment among its ``SegmentedLightCurve``."""
+    start_position: int
+    """Index into the input ``FilteredLightCurve``'s retained arrays of
+    this segment's first cadence."""
+    end_position: int
+    """Index into the input ``FilteredLightCurve``'s retained arrays of
+    this segment's last cadence (inclusive)."""
+    start_source_index: int
+    """Original FITS row index of this segment's first cadence."""
+    end_source_index: int
+    """Original FITS row index of this segment's last cadence."""
+    time: tuple[float, ...]
+    flux: tuple[float, ...]
+    flux_err: tuple[float, ...] | None
+    quality: tuple[int, ...]
+    source_indices: tuple[int, ...]
+
+    @property
+    def start_time(self) -> float:
+        return self.time[0]
+
+    @property
+    def end_time(self) -> float:
+        return self.time[-1]
+
+    @property
+    def cadence_count(self) -> int:
+        return len(self.time)
+
+
+class SegmentationStats(BaseModel):
+    """Summary counts and cadence-estimation results for one segmentation
+    run."""
+
+    model_config = ConfigDict(frozen=True)
+
+    total_cadences: int
+    segment_count: int
+    gap_count: int
+    measured_nominal_cadence: float | None
+    """Median of strictly positive, finite consecutive TIME differences,
+    in days. ``None`` when fewer than two retained cadences exist to
+    compute a difference from -- not an error (see
+    ``app.data.gap_segmentation``'s edge-case handling)."""
+    metadata_cadence_seconds: float | None
+    """``FitsMetadata.cadence_seconds`` as parsed from the FITS
+    ``TIMEDEL`` keyword, carried through unchanged for reference."""
+    metadata_cadence_native: float | None
+    """``metadata_cadence_seconds`` converted into TIME's native unit
+    (days), so it is directly comparable with ``measured_nominal_cadence``."""
+    cadence_sources_agree: bool | None
+    """Whether ``measured_nominal_cadence`` and ``metadata_cadence_native``
+    agree within ``GapDetectionConfig.cadence_disagreement_fraction``.
+    ``None`` when either cadence is unavailable. This is purely
+    informational: gap detection always uses the measured cadence, never
+    the metadata value, so a disagreement is recorded but never silently
+    changes behaviour."""
+    total_estimated_missing_cadences: int
+    """Sum of every gap's ``estimated_missing_cadences`` that could be
+    defensibly estimated; gaps with no defensible estimate contribute
+    zero rather than being guessed at."""
+
+
+class GapDetectionStep(BaseModel):
+    """One recorded Phase 3B transformation, for end-to-end provenance --
+    the ``ProcessingStep`` equivalent for gap detection and segmentation.
+
+    Deliberately carries no wall-clock timestamp: the result stays a pure
+    function of its inputs, so a rerun on the same filtered light curve
+    with the same config is reproducible byte-for-byte."""
+
+    model_config = ConfigDict(frozen=True)
+
+    step: str
+    code_version: str
+    config: GapDetectionConfig
+    input_cadences: int
+    output_segment_count: int
+    output_gap_count: int
+    input_checksum_sha256: str
+    """SHA-256 of the original source FITS file, carried through from the
+    input ``FilteredLightCurve``'s provenance."""
+
+
+class SegmentedLightCurve(BaseModel):
+    """A ``FilteredLightCurve`` divided into contiguous segments at every
+    detected gap.
+
+    Every retained value is a copy of the input ``FilteredLightCurve``'s
+    values -- no arithmetic of any kind is applied, and the input is
+    never mutated. ``history`` carries forward every prior processing
+    step (e.g. Phase 3A's quality-filter step) plus this phase's own
+    ``GapDetectionStep``, so full provenance survives segmentation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    segments: tuple[LightCurveSegment, ...]
+    gaps: tuple[DetectedGap, ...]
+    stats: SegmentationStats
+    flux_column: str
+    provenance: FileProvenance
+    metadata: FitsMetadata
+    history: tuple[ProcessingStep | GapDetectionStep, ...]
+
+    @property
+    def cadence_count(self) -> int:
+        return sum(segment.cadence_count for segment in self.segments)

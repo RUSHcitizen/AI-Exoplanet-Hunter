@@ -77,6 +77,29 @@ silently. See
 [`docs/architecture.md`](docs/architecture.md#current-status-phase-3a-quality-and-finite-value-filtering)
 for the full bit table, citations, and scientific guarantees.
 
+**Phase 3B: Gap detection and contiguous segmentation** -- complete.
+Filter by quality, then detect TIME discontinuities large enough to be
+real observation gaps (not ordinary cadence jitter) and divide the
+result into contiguous segments -- selecting and grouping cadences only,
+never modifying a value:
+
+```bash
+cd backend
+python -m app.cli segment-light-curve data/raw/tess/sector_001/<filename>.fits
+python -m app.cli segment-light-curve <path>.fits --gap-multiplier 3.0 --gap-tolerance 0.001
+```
+
+An interval between two consecutive retained cadences is a gap when it
+exceeds `nominal_cadence * gap_multiplier + gap_tolerance`, where
+`nominal_cadence` is the **median** of consecutive TIME differences
+(default multiplier `5.0`, default tolerance `1e-6` days). Each detected
+gap records exact retained-array positions and original FITS row
+indices on both sides, whether it stems from Phase 3A rejecting rows in
+between, a genuine interruption in observation, or both, and -- when
+defensible -- how many cadences are estimated missing. See
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-3b-gap-detection-and-contiguous-segmentation)
+for the full gap rule, edge cases, and known limitations.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -165,7 +188,8 @@ frontend independently.
    - **2A: target and observation discovery** -- done.
    - **2B: FITS download, caching, and parsing** -- done.
 3. Light-curve preprocessing pipeline.
-   - **3A: quality and finite-value filtering** -- done (this milestone).
+   - **3A: quality and finite-value filtering** -- done.
+   - **3B: gap detection and contiguous segmentation** -- done (this milestone).
 4. Transit-search engine (Box Least Squares + pluggable interface).
 5. Physical property estimation.
 6. Synthetic planetary system generator.
