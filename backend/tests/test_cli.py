@@ -788,3 +788,170 @@ def test_main_segment_light_curve_defaults_to_mast_policy_and_gap_config(
 def test_main_segment_light_curve_rejects_unknown_policy_choice() -> None:
     with pytest.raises(SystemExit):
         cli.main(["segment-light-curve", "sample.fits", "--quality-policy", "aggressive"])
+
+
+def _make_negative_flux_fits(path: Path) -> Path:
+    """A clean, five-cadence light curve whose flux is uniformly
+    negative, so its single segment's median reference is negative and
+    must not be normalized."""
+    primary = fits.PrimaryHDU()
+    primary.header["TELESCOP"] = "TESS"
+    primary.header["TICID"] = 261136679
+    primary.header["SECTOR"] = 1
+    primary.header["CAMERA"] = 2
+    primary.header["CCD"] = 3
+    primary.header["PROCVER"] = "spoc-5.0.10-20200904"
+    primary.header["OBJECT"] = "TIC 261136679"
+
+    columns = [
+        fits.Column(name="TIME", format="D", array=np.arange(5, dtype=np.float64)),
+        fits.Column(name="QUALITY", format="J", array=np.zeros(5, dtype=np.int32)),
+        fits.Column(name="PDCSAP_FLUX", format="D", array=np.full(5, -100.0, dtype=np.float64)),
+        fits.Column(name="PDCSAP_FLUX_ERR", format="D", array=np.full(5, 1.0, dtype=np.float64)),
+    ]
+    lc_hdu = fits.BinTableHDU.from_columns(columns, name="LIGHTCURVE")
+    lc_hdu.header["TIMESYS"] = "TDB"
+    lc_hdu.header["TIMEDEL"] = 120.0 / 86400.0
+    fits.HDUList([primary, lc_hdu]).writeto(path)
+    return path
+
+
+def test_run_normalize_light_curve_success_prints_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _make_gapped_fits(tmp_path / "gapped-lc.fits")
+
+    exit_code = cli.run_normalize_light_curve(str(path))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Total cadences:           6" in out
+    assert "Segments:                 2" in out
+    assert "Normalized segments:      2" in out
+    assert "Un-normalized segments:   0" in out
+    assert "status=normalized" in out
+    assert "The source FITS file was not modified." in out
+    assert "No sigma clipping, outlier rejection, detrending" in out
+
+
+def test_run_normalize_light_curve_does_not_modify_the_source_file(tmp_path: Path) -> None:
+    path = _make_gapped_fits(tmp_path / "gapped-lc.fits")
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    assert cli.run_normalize_light_curve(str(path)) == 0
+
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_run_normalize_light_curve_reports_negative_reference_segment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _make_negative_flux_fits(tmp_path / "negative-lc.fits")
+
+    exit_code = cli.run_normalize_light_curve(str(path))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Normalized segments:      0" in out
+    assert "Un-normalized segments:   1" in out
+    assert "negative_reference: 1" in out
+    assert "status=negative_reference" in out
+
+
+def test_run_normalize_light_curve_invalid_zero_reference_tolerance_returns_exit_code_6(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _make_gapped_fits(tmp_path / "gapped-lc.fits")
+
+    exit_code = cli.run_normalize_light_curve(str(path), zero_reference_tolerance=-1.0)
+
+    assert exit_code == 6
+    assert "Invalid configuration" in capsys.readouterr().err
+
+
+def test_run_normalize_light_curve_invalid_quality_policy_returns_exit_code_6(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _make_gapped_fits(tmp_path / "gapped-lc.fits")
+
+    exit_code = cli.run_normalize_light_curve(str(path), quality_policy="aggressive")
+
+    assert exit_code == 6
+    assert "Invalid configuration" in capsys.readouterr().err
+
+
+def test_run_normalize_light_curve_missing_file_returns_exit_code_5(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = cli.run_normalize_light_curve(str(tmp_path / "nope.fits"))
+
+    assert exit_code == 5
+    assert "FITS file not found" in capsys.readouterr().err
+
+
+def test_run_normalize_light_curve_invalid_file_returns_exit_code_5(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_path = tmp_path / "bad.fits"
+    bad_path.write_bytes(b"not a fits file")
+
+    exit_code = cli.run_normalize_light_curve(str(bad_path))
+
+    assert exit_code == 5
+    assert "Invalid FITS file" in capsys.readouterr().err
+
+
+def test_main_dispatches_normalize_light_curve_with_parsed_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_normalize_light_curve(fits_path: str, **kwargs: Any) -> int:
+        captured["fits_path"] = fits_path
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(cli, "run_normalize_light_curve", fake_run_normalize_light_curve)
+
+    exit_code = cli.main(
+        [
+            "normalize-light-curve",
+            "data/raw/tess/sample.fits",
+            "--quality-policy",
+            "custom",
+            "--quality-bitmask",
+            "128",
+            "--gap-multiplier",
+            "3.0",
+            "--zero-reference-tolerance",
+            "0.001",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["fits_path"] == "data/raw/tess/sample.fits"
+    assert captured["kwargs"]["quality_policy"] == "custom"
+    assert captured["kwargs"]["quality_bitmask"] == 128
+    assert captured["kwargs"]["gap_multiplier"] == 3.0
+    assert captured["kwargs"]["zero_reference_tolerance"] == 0.001
+
+
+def test_main_normalize_light_curve_defaults_to_mast_policy_and_zero_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_normalize_light_curve(fits_path: str, **kwargs: Any) -> int:
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(cli, "run_normalize_light_curve", fake_run_normalize_light_curve)
+
+    assert cli.main(["normalize-light-curve", "sample.fits"]) == 0
+    assert captured["kwargs"]["quality_policy"] == "mast"
+    assert captured["kwargs"]["zero_reference_tolerance"] == 0.0
+
+
+def test_main_normalize_light_curve_rejects_unknown_policy_choice() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["normalize-light-curve", "sample.fits", "--quality-policy", "aggressive"])

@@ -119,3 +119,20 @@ class NonMonotonicTimeError(GapSegmentationError):
     Phase 3B never reorders, deduplicates, or otherwise silently repairs
     measurements; a non-monotonic TIME sequence is reported as an error
     instead."""
+
+
+class NormalizationError(ProcessingError):
+    """Base class for errors raised while normalizing an already
+    segmented light curve (Phase 3C).
+
+    A segment whose median reference is zero, negative, or otherwise
+    unusable is **not** one of these errors -- that is recorded per
+    segment as a ``ReferenceIssue`` instead, so one bad segment never
+    blocks the others. This class is reserved for conditions that make
+    the whole run unusable (an invalid config, or a structurally
+    malformed segment)."""
+
+
+class InvalidNormalizationConfigError(NormalizationError):
+    """The supplied ``NormalizationConfig`` is not usable (e.g. a
+    negative ``zero_reference_tolerance``)."""

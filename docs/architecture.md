@@ -26,7 +26,9 @@ Quality filtering (TESS quality flags)
         |
 Gap detection and contiguous segmentation (TIME discontinuities)
         |
-Light-curve preprocessing (normalization, sigma clipping)
+Per-segment flux normalization (median-ratio)
+        |
+Sigma clipping (per-segment outlier rejection)
         |
 Detrending (median / Savitzky-Golay / spline / custom)
         |
@@ -594,6 +596,188 @@ TIME/source-index round-tripped through the segments in order with no
 omission or duplication, and the `FilteredLightCurve` input was
 confirmed unchanged by `model_dump()` equality.
 
+## Current status: Phase 3C (Per-segment flux normalization)
+
+This is the `Per-segment flux normalization` stage of the data flow
+above -- the third slice of roadmap phase 3. It takes a
+`SegmentedLightCurve` and divides each `LightCurveSegment`'s flux by a
+reference computed **only from that segment's own values**, so a
+segment's normalization never depends on -- and never crosses -- a
+Phase 3B gap boundary. No cadence is ever removed, reordered, or
+duplicated; TIME, QUALITY, source indices, gap records, and every prior
+processing step are carried through unchanged.
+
+Implemented:
+- `app/data/normalization.py` -- `normalize_light_curve(segmented, config)`,
+  a pure function from a `SegmentedLightCurve` plus a
+  `NormalizationConfig` to a new `NormalizedLightCurve`.
+- New typed models (`app/data/models.py`): `NormalizationConfig`,
+  `ReferenceIssue`, `SegmentNormalizationStats`, `NormalizedSegment`,
+  `NormalizationStats`, `NormalizationStep`, `NormalizedLightCurve`.
+- New exceptions (`app/data/exceptions.py`): `NormalizationError`,
+  `InvalidNormalizationConfigError`.
+- `app/cli.py` -- a `normalize-light-curve` command that filters,
+  segments, and normalizes in one step:
+
+```bash
+python -m app.cli normalize-light-curve <path>.fits                              # mast policy, default config
+python -m app.cli normalize-light-curve <path>.fits --zero-reference-tolerance 1e-6
+python -m app.cli normalize-light-curve <path>.fits --gap-multiplier 3.0 --quality-policy hard
+```
+
+  It reports total cadences, segment/normalized/un-normalized counts, a
+  per-issue breakdown of why any segment was left un-normalized, a
+  per-segment reference and status line, the code version, and the
+  source checksum.
+
+Explicitly not implemented: sigma clipping, outlier rejection,
+detrending, smoothing, spline fitting, Gaussian processes,
+interpolation, gap filling, sector stitching, transit search, feature
+extraction, machine learning, database persistence, or dashboard/API
+integration. **Sigma clipping remains a separate, later milestone
+(tentatively Phase 3D)** and must not be confused with normalization:
+normalization only rescales each segment by one constant; it never
+examines individual cadences for outliers and never excludes a cadence
+from the output.
+
+### Median-ratio normalization
+
+The only supported algorithm is::
+
+```
+normalized_flux = flux / segment_reference
+```
+
+where `segment_reference` is the **median** of the segment's finite
+flux values -- median, not mean, for the same robustness reason Phase
+3B measures cadence with a median: a brief transit or a handful of
+outlying flux values would bias a mean, but cannot move a median by
+more than its own magnitude allows. The expected baseline for a
+successfully normalized segment is `normalized_flux ~= 1.0`.
+
+There is no method-selector field or `NormalizationMethod` enum: with
+exactly one documented algorithm, pinned by `code_version`, a
+single-member enum would be an abstraction with nothing to abstract
+over -- the same reason `GapDetectionStep` has no "gap rule" field.
+`relative_flux = normalized_flux - 1` is also intentionally **not**
+stored anywhere: it is a lossless, one-line derivation of
+`normalized_flux`, so persisting it would duplicate scientific data for
+no new information.
+
+### Independent per-segment calculation, and why normalization never crosses a gap
+
+Every segment's reference is computed from that segment's `flux` tuple
+alone. `LightCurveSegment.flux` is already gap-isolated by Phase 3B's
+own construction (sliced from the parent `FilteredLightCurve` at
+segment boundaries), and `app.data.normalization` never reads two
+segments' arrays together -- there is no code path by which one
+segment's flux can influence another segment's reference or normalized
+values. This is verified directly: changing one segment's flux leaves
+every other segment's `normalized_flux` and `stats.reference`
+byte-identical.
+
+### Why negative and nonpositive references are not normalized
+
+Dividing by a negative reference reverses the direction of every flux
+variation in the segment: a downward change in raw flux would become an
+upward normalized feature, which would be unsafe for later transit
+analysis (a real transit dip could appear as a normalized brightening).
+A reference of zero, or within `NormalizationConfig.zero_reference_tolerance`
+of zero, makes the ratio undefined or numerically meaningless. Neither
+condition is ever silently normalized:
+
+| `ReferenceIssue` | Condition | Checked |
+|---|---|---|
+| `NO_FINITE_FLUX` | No cadence in the segment has a finite flux value | first |
+| `NONFINITE_REFERENCE` | The median itself is not finite (reachable only via floating-point overflow averaging two extreme-magnitude central values -- see `tests/test_normalization.py`'s worked example) | second |
+| `ZERO_REFERENCE` | `abs(reference) <= zero_reference_tolerance` (exact zero always included) | third |
+| `NEGATIVE_REFERENCE` | `reference < 0`, outside the zero tolerance | fourth |
+
+A segment with any of these issues is left un-normalized
+(`normalized_flux`/`normalized_flux_err` are `None`), but its original
+`LightCurveSegment` -- every TIME, flux, flux error, QUALITY, and
+source index -- is fully preserved in the output, and every other
+segment is still normalized. One bad segment never blocks the rest of
+the file.
+
+### Mixed finite/nonfinite flux within a segment
+
+Phase 3A's default configuration (`require_finite_flux=True`) already
+removes nonfinite flux before a light curve ever reaches this stage, so
+this case does not arise under standard configuration. It remains
+explicitly handled for light curves quality-filtered with
+`require_finite_flux=False`, or objects constructed directly: **the
+reference is calculated from the segment's finite flux values only,
+and every cadence -- finite or not -- is still normalized.** A cadence
+whose original flux is NaN or +/-inf divides through to a nonfinite
+`normalized_flux` value at that position via ordinary floating-point
+division (`nan / reference` is `nan`; `inf / reference` is `inf` for a
+positive reference) -- no special-casing is needed, and no cadence is
+silently dropped or its count silently changed.
+
+### Flux-error propagation
+
+For a successfully normalized segment::
+
+```
+normalized_flux_err = flux_err / abs(segment_reference)
+```
+
+This treats the computed reference as an **exact** scaling constant.
+**The median estimator's own sampling uncertainty is not propagated**
+into `normalized_flux_err` -- a deliberate simplification (also made
+by, e.g., Lightkurve's own `.normalize()`), not an oversight. When the
+input has no `flux_err` column at all, `normalized_flux_err` remains
+`None` for every segment, and it is also `None` whenever
+`normalized_flux` is `None` for that segment.
+
+### Edge cases
+
+- **Empty `SegmentedLightCurve`** (zero segments): zero segments out.
+  Not an error.
+- **One-cadence segments**: the median of one value is that value, so
+  `normalized_flux == (1.0,)` whenever that value is itself finite,
+  positive, and outside the zero tolerance. No special-cased code path
+  exists for this -- it falls out of the general algorithm.
+- **A segment with no finite flux at all**: `ReferenceIssue.NO_FINITE_FLUX`;
+  `normalized_flux`/`normalized_flux_err` are `None`.
+
+### Scientific guarantees
+
+- No cadence is ever removed, reordered, or duplicated by this module,
+  including cadences in a segment whose reference is invalid.
+- The input `SegmentedLightCurve` is never mutated (frozen models,
+  tuple fields).
+- `gaps` and every prior `history` entry (Phase 3A's `ProcessingStep`,
+  Phase 3B's `GapDetectionStep`) are carried through unchanged; this
+  phase's own `NormalizationStep` (no timestamp) is appended.
+- The result is a pure function of `(segmented, config)` -- reruns are
+  reproducible byte-for-byte, verified with `model_dump_json()`
+  equality in both the unit tests and the real-data check below.
+- This is not detrending (no time-varying baseline is fit or removed)
+  and not outlier rejection (no cadence is ever excluded from the
+  output because of its flux value).
+
+### Real-data sanity check
+
+Run `normalize-light-curve` (default `mast` quality policy, default gap
+and normalization config) against the same cached SPOC product as the
+Phase 3A/3B checks (TIC 261136679 / Pi Mensae, sector 1): all **46**
+Phase 3B segments (18,264 total cadences) received a valid, positive
+median reference and normalized successfully -- **zero** segments hit
+any `ReferenceIssue`. Segment references ranged from a minimum of
+1,464,203.25 to a maximum of 1,465,118.5 electrons/s (median across
+segments 1,464,608.22), consistent with PDCSAP flux for a bright,
+stable star with no large intra-segment excursions. Every successfully
+normalized segment's own `normalized_flux` has a median within
+`1e-9` of exactly `1.0`, as expected by construction. The file's
+SHA-256, size, and mtime were identical before and after; cadence and
+segment counts matched Phase 3A/3B exactly; every retained TIME and
+source index round-tripped through the normalized segments in order
+with no omission or duplication; `gaps` was identical to Phase 3B's own
+output; and two runs on the same input produced byte-identical
+`model_dump_json()` output.
+
 ## Known limitations of this milestone
 
 - The backend Docker image installs only core web-service dependencies.
@@ -639,6 +823,21 @@ confirmed unchanged by `model_dump()` equality.
   (e.g. a mid-sector pipeline reprocessing) is not currently detected as
   such -- it would show up only indirectly, as apparent gaps or unusual
   `interval_to_cadence_ratio` values.
+- A segment's median reference has no protection against a transit (or
+  other astrophysical dip) that occupies a large fraction of that
+  segment: the median's ~50% breakdown point makes it robust to a
+  brief transit, but a segment mostly *within* a long transit or an
+  eclipsing binary would still bias its own reference. This is an
+  inherent limitation of any reference-based normalization at this
+  stage, not a bug.
+- Very short segments (one or two cadences) have essentially no
+  robustness in their median reference -- it is just one of the raw
+  values. This is not corrected by merging or filtering short segments,
+  since doing so would mean rejecting or moving cadences, which this
+  phase never does.
+- `normalized_flux_err` treats the segment's median reference as an
+  exact constant; the reference's own sampling uncertainty is not
+  propagated into the reported error.
 - `parse_light_curve` only supports the standard SPOC/TESS-SPOC
   light-curve FITS schema (a `LIGHTCURVE` extension with `TIME`,
   `QUALITY`, and `PDCSAP_FLUX`/`SAP_FLUX` columns). QLP light curves use

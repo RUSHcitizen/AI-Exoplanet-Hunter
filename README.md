@@ -100,6 +100,28 @@ defensible -- how many cadences are estimated missing. See
 [`docs/architecture.md`](docs/architecture.md#current-status-phase-3b-gap-detection-and-contiguous-segmentation)
 for the full gap rule, edge cases, and known limitations.
 
+**Phase 3C: Per-segment flux normalization** -- complete. Filter,
+segment, then divide each segment's flux by its own median -- entirely
+independently of every other segment, so nothing is ever averaged or
+scaled across a gap:
+
+```bash
+cd backend
+python -m app.cli normalize-light-curve data/raw/tess/sector_001/<filename>.fits
+python -m app.cli normalize-light-curve <path>.fits --zero-reference-tolerance 1e-6
+```
+
+`normalized_flux = flux / segment_reference`, where `segment_reference`
+is the **median** of the segment's finite flux values (baseline
+~1.0 for a successfully normalized segment). A segment whose reference
+is zero, near-zero (within `--zero-reference-tolerance`), or **negative**
+is left un-normalized rather than silently normalized -- dividing by a
+negative reference would flip the direction of every flux variation in
+that segment, which would be unsafe for later transit analysis. Every
+cadence is still reported either way; nothing is ever removed. See
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-3c-per-segment-flux-normalization)
+for the full rule, error propagation, and known limitations.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -189,7 +211,8 @@ frontend independently.
    - **2B: FITS download, caching, and parsing** -- done.
 3. Light-curve preprocessing pipeline.
    - **3A: quality and finite-value filtering** -- done.
-   - **3B: gap detection and contiguous segmentation** -- done (this milestone).
+   - **3B: gap detection and contiguous segmentation** -- done.
+   - **3C: per-segment flux normalization** -- done (this milestone).
 4. Transit-search engine (Box Least Squares + pluggable interface).
 5. Physical property estimation.
 6. Synthetic planetary system generator.

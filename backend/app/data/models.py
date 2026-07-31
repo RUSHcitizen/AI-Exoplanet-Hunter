@@ -6,7 +6,11 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from app.data.exceptions import InvalidFilterConfigError, InvalidGapDetectionConfigError
+from app.data.exceptions import (
+    InvalidFilterConfigError,
+    InvalidGapDetectionConfigError,
+    InvalidNormalizationConfigError,
+)
 from app.data.quality_flags import (
     POLICY_BITMASKS,
     PROJECT_DEFAULT_POLICY,
@@ -596,3 +600,170 @@ class SegmentedLightCurve(BaseModel):
     @property
     def cadence_count(self) -> int:
         return sum(segment.cadence_count for segment in self.segments)
+
+
+class NormalizationConfig(BaseModel):
+    """Configuration for one per-segment flux-normalization run (Phase 3C).
+
+    Deliberately minimal: median-ratio normalization
+    (``flux / segment_reference``) is the only supported algorithm, so
+    there is no method selector here -- see ``app.data.normalization``'s
+    module docstring for why.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    zero_reference_tolerance: float = 0.0
+    """A segment's median reference is treated as ``ZERO_REFERENCE``
+    when ``abs(reference) <= zero_reference_tolerance`` -- exact zero is
+    always included regardless of this value. Must be >= 0."""
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.zero_reference_tolerance < 0:
+            raise InvalidNormalizationConfigError(
+                f"zero_reference_tolerance must be >= 0, got {self.zero_reference_tolerance}."
+            )
+        return self
+
+
+class ReferenceIssue(StrEnum):
+    """Why a segment's median flux reference could not be used to
+    normalize it.
+
+    Checked in this fixed order, so a value can only carry the first
+    condition that applies to it:
+
+    1. ``NO_FINITE_FLUX`` -- no cadence in the segment has a finite flux
+       value, so no median can be computed at all.
+    2. ``NONFINITE_REFERENCE`` -- a median *was* computed from finite
+       values but is itself not finite. Only reachable through
+       floating-point overflow when averaging the two central values of
+       an even-length segment at extreme magnitude; see
+       ``app.data.normalization`` for a worked example.
+    3. ``ZERO_REFERENCE`` -- ``abs(reference) <= zero_reference_tolerance``
+       (exact zero is always included, regardless of the configured
+       tolerance).
+    4. ``NEGATIVE_REFERENCE`` -- ``reference < 0`` and outside the zero
+       tolerance. Dividing by a negative reference would reverse the
+       direction of every flux variation in the segment (a downward
+       change in raw flux would become an upward normalized feature),
+       which is unsafe for any later transit analysis, so this is never
+       treated as a successful normalization.
+    """
+
+    NO_FINITE_FLUX = "no_finite_flux"
+    NONFINITE_REFERENCE = "nonfinite_reference"
+    ZERO_REFERENCE = "zero_reference"
+    NEGATIVE_REFERENCE = "negative_reference"
+
+
+class SegmentNormalizationStats(BaseModel):
+    """Per-segment diagnostic record for one normalization attempt."""
+
+    model_config = ConfigDict(frozen=True)
+
+    reference: float | None
+    """The computed median reference, in the segment's native flux
+    units. ``None`` only for ``NO_FINITE_FLUX`` (there is nothing to
+    report a value for); otherwise always recorded -- even when
+    invalid -- so a zero, negative, or nonfinite value is visible rather
+    than hidden."""
+    finite_flux_count: int
+    """How many of the segment's cadences had a finite flux value and
+    contributed to the median."""
+    reference_valid: bool
+    reference_issue: ReferenceIssue | None
+    """``None`` exactly when ``reference_valid`` is ``True``."""
+
+
+class NormalizedSegment(BaseModel):
+    """One ``LightCurveSegment``'s normalization result.
+
+    The original segment is embedded, not copied field-by-field, so
+    TIME, original flux, original flux error, QUALITY, source indices,
+    and segment/source-row boundaries are preserved by construction --
+    there is exactly one copy of each, and nothing here can silently
+    diverge from it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    segment: LightCurveSegment
+    normalized_flux: tuple[float, ...] | None
+    """``flux / stats.reference`` for every cadence in ``segment.flux``,
+    same order, same length. A cadence whose original flux was itself
+    nonfinite (NaN or +/-inf) yields a nonfinite normalized value the
+    same way -- it is never silently dropped or replaced. ``None``
+    exactly when ``stats.reference_valid`` is ``False``; never partially
+    populated."""
+    normalized_flux_err: tuple[float, ...] | None
+    """``flux_err / abs(stats.reference)`` for every cadence, or
+    ``None`` when the input had no ``flux_err`` column at all, or when
+    ``normalized_flux`` is ``None``."""
+    stats: SegmentNormalizationStats
+
+
+class NormalizationStats(BaseModel):
+    """Summary counts for one normalization run."""
+
+    model_config = ConfigDict(frozen=True)
+
+    total_cadences: int
+    segment_count: int
+    normalized_segment_count: int
+    invalid_segment_count: int
+    invalid_by_issue: dict[ReferenceIssue, int]
+    """Per-issue counts of segments that could not be normalized. Unlike
+    ``QualityFilterStats.rejected_by_reason``, each segment carries at
+    most one ``ReferenceIssue``, so this **is** a partition: its values
+    sum to exactly ``invalid_segment_count``."""
+
+
+class NormalizationStep(BaseModel):
+    """One recorded Phase 3C transformation, for end-to-end provenance --
+    the ``ProcessingStep``/``GapDetectionStep`` equivalent for
+    normalization.
+
+    Deliberately carries no wall-clock timestamp: the result stays a
+    pure function of its inputs, so a rerun on the same segmented light
+    curve with the same config is reproducible byte-for-byte."""
+
+    model_config = ConfigDict(frozen=True)
+
+    step: str
+    code_version: str
+    config: NormalizationConfig
+    input_cadences: int
+    input_segment_count: int
+    normalized_segment_count: int
+    input_checksum_sha256: str
+    """SHA-256 of the original source FITS file, carried through from the
+    input ``SegmentedLightCurve``'s provenance."""
+
+
+class NormalizedLightCurve(BaseModel):
+    """A ``SegmentedLightCurve`` with each segment independently
+    normalized to a median-ratio flux scale.
+
+    Every cadence from the input is present in exactly one
+    ``NormalizedSegment``; no value is removed, reordered, or duplicated,
+    and the input is never mutated. ``gaps`` is carried through
+    unchanged. ``history`` carries forward every prior processing step
+    (Phase 3A's ``ProcessingStep``, Phase 3B's ``GapDetectionStep``) plus
+    this phase's own ``NormalizationStep``, so full provenance survives
+    normalization."""
+
+    model_config = ConfigDict(frozen=True)
+
+    segments: tuple[NormalizedSegment, ...]
+    gaps: tuple[DetectedGap, ...]
+    stats: NormalizationStats
+    flux_column: str
+    provenance: FileProvenance
+    metadata: FitsMetadata
+    history: tuple[ProcessingStep | GapDetectionStep | NormalizationStep, ...]
+
+    @property
+    def cadence_count(self) -> int:
+        return sum(segment.segment.cadence_count for segment in self.segments)
