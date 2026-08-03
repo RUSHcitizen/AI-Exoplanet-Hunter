@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     data_dir: str = "../data"
     mast_cache_dir: str = "../data/raw/tess"
 
+    pi_mensae_demo_fits_path: str = (
+        "../data/raw/tess/sector_001/tess2018206045859-s0001-0000000261136679-0120-s_lc.fits"
+    )
+    """Fixed local cache path for the Phase 4A Pi Mensae demonstration
+    light curve (TIC 261136679, sector 1, SPOC). Never supplied by the
+    frontend -- the demo API always resolves this one path."""
+
 
 @lru_cache
 def get_settings() -> Settings:

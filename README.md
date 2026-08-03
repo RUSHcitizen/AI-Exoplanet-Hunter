@@ -183,6 +183,48 @@ flux replacement, interpolation, smoothing, detrending, transit
 detection, Box Least Squares, machine learning, or website/database
 integration.
 
+**Phase 4A: Local Pi Mensae science website preview** -- complete. A
+read-only Mission Control dashboard that runs the completed Phase
+3A-3D pipeline against the cached Pi Mensae sector 1 FITS file and
+displays the real result:
+
+```bash
+make dev
+# then open http://localhost:3000/demo/pi-mensae
+```
+
+Backend endpoints (`backend/app/api/demo.py`, registered under
+`/api/v1`):
+
+- `GET /api/v1/demo/pi-mensae` -- pipeline summary: identity, raw/Phase
+  3A/3B/3C/3D statistics, processing history, and scientific
+  limitations.
+- `GET /api/v1/demo/pi-mensae/light-curve` -- the normalized light
+  curve, grouped by Phase 3B segment with Phase 3B gaps listed
+  separately, so a chart can never draw a line across a gap.
+
+Both endpoints are fixed to one local file (`backend/app/services/demo_pipeline.py`
+resolves it from typed settings, never from a request parameter),
+read-only, and deterministic -- repeated requests return identical
+results and never modify the source FITS file. There is no database
+persistence, no upload, and no browser-triggered reprocessing of an
+arbitrary file.
+
+The frontend route (`frontend/src/app/demo/pi-mensae/page.tsx`) renders
+the pipeline status, summary statistics, a gap-aware canvas/SVG light
+curve chart, per-phase detail panels, processing history, and a visible
+scientific-limitations panel. High statistical outliers are marked with
+a distinct triangle marker and the legend "Statistical high outlier --
+not a planet candidate"; the dashboard never implies a candidate or
+confirmed planet. If the backend is unreachable or the cached FITS file
+is missing, the page shows a clear error state rather than fabricated
+zero values.
+
+**Explicitly not implemented by Phase 4A:** detrending, transit search,
+Box Least Squares, candidate scoring, machine learning, deployment,
+arbitrary target selection, file uploads, authentication, or database
+persistence.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -274,20 +316,23 @@ frontend independently.
    - **3A: quality and finite-value filtering** -- done.
    - **3B: gap detection and contiguous segmentation** -- done.
    - **3C: per-segment flux normalization** -- done.
-   - **3D: robust per-segment outlier flagging** -- done (this milestone).
-4. Transit-search engine (Box Least Squares + pluggable interface).
-5. Physical property estimation.
-6. Synthetic planetary system generator.
-7. Candidate feature engineering.
-8. Machine-learning classifier (classical baseline).
-9. Known-planet cross-matching.
-10. Candidate-ranking engine.
-11. Full database schema + migrations.
-12. Full FastAPI endpoint surface.
-13. Full Mission Control dashboard (target explorer, transit-search view,
+   - **3D: robust per-segment outlier flagging** -- done.
+4. Mission Control website.
+   - **4A: local Pi Mensae science website preview** -- done (this
+     milestone).
+5. Transit-search engine (Box Least Squares + pluggable interface).
+6. Physical property estimation.
+7. Synthetic planetary system generator.
+8. Candidate feature engineering.
+9. Machine-learning classifier (classical baseline).
+10. Known-planet cross-matching.
+11. Candidate-ranking engine.
+12. Full database schema + migrations.
+13. Full FastAPI endpoint surface.
+14. Full Mission Control dashboard (target explorer, transit-search view,
     candidate detail, model laboratory, system operations).
-14. Scientific candidate reports.
-15. Autonomous research agent for batch analysis.
+15. Scientific candidate reports.
+16. Autonomous research agent for batch analysis.
 
 Further "extremely difficult" extensions (explainable AI, distributed
 processing, citizen-science review, follow-up planning, pixel-level

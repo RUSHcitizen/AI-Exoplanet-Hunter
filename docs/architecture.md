@@ -989,6 +989,163 @@ through the flagged segments in order with no omission or duplication;
 and two runs on the same input produced byte-identical
 `model_dump_json()` output.
 
+## Current status: Phase 4A (Local Pi Mensae science website preview)
+
+This is the first slice of roadmap phase 4 (Mission Control website): a
+local, read-only dashboard that runs the completed Phase 3A-3D pipeline
+against one fixed cached observation (TIC 261136679 / Pi Mensae,
+sector 1) and displays the real result. It adds no new scientific
+processing -- no detrending, transit search, Box Least Squares,
+candidate scoring, or machine learning.
+
+Implemented:
+- `backend/app/services/demo_pipeline.py` -- `run_demo_pipeline(fits_path)`,
+  a small orchestration function that sequences the existing Phase
+  3A-3D pure functions (`filter_quality`, `segment_light_curve`,
+  `normalize_light_curve`, `flag_outliers`) with each stage's
+  project-default configuration and returns every stage's result. A
+  process-local, in-memory cache keyed by the file's resolved path,
+  size, and modification time avoids repeating the ~20k-cadence run on
+  every request; it holds nothing on disk and is invalidated
+  automatically if the file underneath the path changes.
+- `backend/app/api/demo.py` -- a read-only router
+  (`GET /api/v1/demo/pi-mensae`, `GET /api/v1/demo/pi-mensae/light-curve`)
+  with API-specific typed response models, kept separate from the core
+  scientific models in `app/data/models.py`. The FITS path is resolved
+  from a typed settings value (`Settings.pi_mensae_demo_fits_path`) via
+  a FastAPI dependency (`get_demo_fits_path`) -- never from a request
+  parameter -- so tests override it cleanly with
+  `app.dependency_overrides` and the frontend cannot request an
+  arbitrary path. A missing file returns a structured `404`; invalid or
+  corrupted FITS data returns a structured `422`.
+- `frontend/src/app/demo/pi-mensae/page.tsx` -- the dashboard page:
+  pipeline status, summary statistic tiles, a gap-aware light-curve
+  chart, per-phase detail panels (quality filtering, segmentation,
+  normalization, outlier flagging), processing history, and a visible
+  scientific-limitations panel. Loading, backend-unavailable,
+  missing-file, and generic-API-error states are distinct and never
+  substitute fabricated zero values for real data.
+- `frontend/src/components/LightCurveChart.tsx` -- draws each Phase 3B
+  segment from its own points only (never one flat connected series),
+  so no code path can draw a line across a gap. The ~18,264 points are
+  drawn once onto a `<canvas>` for performance; the handful of
+  high-outlier markers and gap-boundary indicators are a separate SVG
+  overlay with real accessible markup (title text, an
+  `aria-label`ed chart summary, and a legend that pairs color with
+  shape). The horizontal axis is literal TIME, so a real gap shows up
+  honestly as blank space rather than an interpolated bridge.
+- `frontend/src/lib/api.ts` -- extended with typed request/response
+  contracts (`DemoSummaryResponse`, `DemoLightCurveResponse`, ...) and
+  `fetchDemoSummary`/`fetchDemoLightCurve`, plus a `DemoApiError` that
+  carries the backend's structured error code and HTTP status so the
+  page can distinguish "file missing" from "backend unreachable."
+- Backend tests: `backend/tests/test_demo_api.py` (HTTP-level, asserting
+  the same real-data numbers recorded below) and
+  `backend/tests/test_demo_pipeline.py` (the orchestration helper
+  directly, including cache-hit and cache-invalidation behavior).
+- Frontend tests: `frontend/tests/demo-page.test.tsx` and
+  `frontend/tests/light-curve-chart.test.tsx`, using the project's
+  existing Vitest + React Testing Library setup. Fixing a latent gap in
+  `frontend/tests/setup.ts` (Testing Library's automatic per-test
+  `cleanup()` was never actually registered, since Vitest only exposes
+  a global `afterEach` when `test.globals: true` is set, which this
+  project does not set) was necessary for multi-test files to pass
+  reliably; it now registers `cleanup()` explicitly.
+
+Explicitly not implemented: file uploads, arbitrary target selection,
+user accounts, authentication, database persistence, background jobs,
+browser-triggered downloads or reprocessing, editing scientific
+results, deployment, detrending, Box Least Squares, transit detection,
+candidate scoring, or machine learning.
+
+### Why a service module, not logic in the route functions
+
+`app/services/demo_pipeline.py` exists so `app/api/demo.py`'s route
+handlers only translate an already-completed pipeline result into
+response models -- the same separation of concerns the rest of the
+backend follows (`app/data/*` never imports FastAPI). This is also
+where the project's `services/` package (reserved since Phase 1 for
+"preprocessing, transit search, ranking, ...") gets its first real
+content: orchestration of already-implemented stages, not new
+scientific logic.
+
+### Read-only guarantees
+
+- The demo endpoints perform no writes, no database operations, and
+  never mutate the FITS file, the parsed pipeline objects, or the
+  request path.
+- The FITS path is fixed by typed settings, never accepted from the
+  browser; a `?path=...` query parameter is silently ignored (FastAPI
+  simply does not bind it to anything).
+- Verified directly: `test_source_fits_file_unchanged_by_repeated_requests`
+  reads the cached file's SHA-256, size, and mtime before and after
+  several summary and chart requests and asserts all three are
+  identical, matching the checksum recorded in the Phase 3A real-data
+  sanity check above.
+
+### Chart response shape
+
+`DemoLightCurveResponse` groups points by Phase 3B segment
+(`DemoLightCurveSegment.points`) and lists `DemoGap` entries separately,
+each naming the segment numbers on either side. This mirrors why
+Phase 3B segments a light curve in the first place: a flat, ungrouped
+point array would let a naive chart draw a connecting line straight
+through a real observation gap. `before_segment_number`/
+`after_segment_number` are derived from the same ordered construction
+`app/data/gap_segmentation.py` uses to build segments and gaps in one
+pass, not recomputed by searching -- gap `i` is always between segments
+`i` and `i+1` (0-indexed) by construction.
+
+### Real-data sanity check
+
+`GET /api/v1/demo/pi-mensae` and `GET /api/v1/demo/pi-mensae/light-curve`,
+run against the same cached SPOC product as every Phase 3 real-data
+check above (TIC 261136679 / Pi Mensae, sector 1,
+`tess2018206045859-s0001-0000000261136679-0120-s_lc.fits`), reproduce
+every one of those checks' numbers exactly, because the demo pipeline
+runs the identical Phase 3A-3D functions with identical default
+configuration: 20,076 raw cadences; 18,264 retained / 1,812 rejected
+under the `mast` policy (mask 21183 / `0x52BF`); 46 Phase 3B segments
+and 45 gaps; 46/46 Phase 3C segments normalized with zero
+`ReferenceIssue`s (reference range 1,464,203.25-1,465,118.5); Phase 3D
+status 33 `VALID` / 13 `INSUFFICIENT_DATA`, 0 `ZERO_SCALE`, 0
+`NORMALIZATION_UNAVAILABLE`; exactly 2 high statistical outliers and 0
+low outliers under the default (lower-side-disabled) configuration. The
+chart response's 46 segments' point counts sum to exactly 18,264, no
+segment is connected across any of the 45 gaps, and exactly 2 chart
+points carry `is_high_outlier=true`. Repeated requests produce
+byte-identical JSON, and the source file's SHA-256
+(`1eecffff3afa7e8c4ad763b6907e62447bacf339968292d86be45acd9bf1d609`),
+size, and modification time were confirmed unchanged before and after,
+both via the automated test and via manual `curl`/browser requests
+against a locally running server.
+
+#### Known limitations of Phase 4A
+
+- The demo is fixed to exactly one target, sector, and cached file --
+  there is no target search, sector picker, or upload path, by design.
+- The in-memory pipeline-result cache is process-local and unbounded
+  (holds at most one entry per distinct file identity actually
+  requested, which in practice is one); it is not shared across
+  worker processes and is lost on restart, which is fine for a local
+  single-process demo but would need a different design for multi-worker
+  deployment.
+- The light-curve chart renders every displayed point rather than
+  applying any display-only decimation; this is fine at ~18k cadences
+  for one sector but would need a downsampling strategy (preserving
+  segment boundaries and every flagged outlier) for a much longer
+  baseline.
+- `robust_score` in the chart response is recomputed per point from
+  each segment's already-computed `center`/`robust_scale` (the same
+  formula `app/data/outlier_detection.py` uses), rather than read from
+  a stored per-cadence field -- Phase 3D only persists `robust_score` on
+  `FlaggedCadence` records for already-flagged cadences, not for every
+  cadence, so the chart response derives it for display without
+  altering any stored scientific value.
+- No visual regression testing is set up; frontend verification relies
+  on Vitest/React Testing Library assertions, `tsc --noEmit`, ESLint,
+  a production `next build`, and manual browser verification.
+
 ## Known limitations of this milestone
 
 - The backend Docker image installs only core web-service dependencies.

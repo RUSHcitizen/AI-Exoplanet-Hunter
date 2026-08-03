@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.demo import router as demo_router
 from app.api.health import router as health_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router, prefix=settings.api_v1_prefix)
     app.include_router(health_router)  # unversioned alias for infra probes
+    app.include_router(demo_router, prefix=settings.api_v1_prefix)
 
     return app
 
