@@ -225,6 +225,41 @@ Box Least Squares, candidate scoring, machine learning, deployment,
 arbitrary target selection, file uploads, authentication, or database
 persistence.
 
+**Phase 4B: Public read-only deployment** -- complete. The Phase 4A
+dashboard is publicly reachable, read-only, with no database and no
+runtime FITS download:
+
+- Frontend: [Vercel](https://vercel.com) (Next.js, `frontend/` as the
+  project root, production branch `master`).
+- Backend: [Render](https://render.com) (`render.yaml` Blueprint; Docker
+  web service, `backend/` as the root directory, free instance type).
+- The exact TIC 261136679 / TESS sector 1 SPOC FITS file is fetched once
+  from NASA/MAST during `docker build`
+  (`backend/app/deploy/provision_demo_fits.py`), verified against its
+  known SHA-256
+  (`1eecffff3afa7e8c4ad763b6907e62447bacf339968292d86be45acd9bf1d609`)
+  and size (2,039,040 bytes), and baked into the image -- never
+  downloaded at request time, never bundled in git.
+- CORS is configured for the exact production frontend origin plus the
+  local dev origins; see `Settings.cors_origins` /
+  `Settings.cors_origin_regex`.
+- The free Render instance can take up to about a minute to wake from
+  idle; the frontend shows a clear "waking" message and retries
+  automatically for a bounded period before offering a manual retry.
+
+**Public dashboard:** _filled in once deployed -- see the live URL
+recorded after Step B of the Phase 4B deployment order in
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-4b-public-read-only-deployment)._
+
+**Explicitly not added by Phase 4B:** a database, a persistent disk,
+background workers, user accounts, authentication, file uploads, or
+arbitrary-target processing -- the public API surface is exactly the
+same two read-only Phase 4A endpoints plus the existing health check.
+See
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-4b-public-read-only-deployment)
+for the full deployment architecture, CORS decision, cold-start
+behavior, and rollback procedure.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -318,8 +353,8 @@ frontend independently.
    - **3C: per-segment flux normalization** -- done.
    - **3D: robust per-segment outlier flagging** -- done.
 4. Mission Control website.
-   - **4A: local Pi Mensae science website preview** -- done (this
-     milestone).
+   - **4A: local Pi Mensae science website preview** -- done.
+   - **4B: public read-only deployment** -- done (this milestone).
 5. Transit-search engine (Box Least Squares + pluggable interface).
 6. Physical property estimation.
 7. Synthetic planetary system generator.

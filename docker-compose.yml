@@ -22,7 +22,7 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-exoplanet}:${POSTGRES_PASSWORD:-exoplanet}@postgres:5432/${POSTGRES_DB:-exoplanet_hunter}
       ENVIRONMENT: development
       LOG_FORMAT: console
-      CORS_ORIGINS: '["http://localhost:3000"]'
+      CORS_ORIGINS: '["http://localhost:3000", "http://127.0.0.1:3000"]'
     ports:
       - "8000:8000"
     volumes:

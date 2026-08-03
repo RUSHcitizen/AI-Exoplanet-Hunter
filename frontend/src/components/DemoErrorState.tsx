@@ -3,9 +3,19 @@
  * backend is unreachable, the cached FITS file is missing, or the
  * response could not be parsed. Never paired with fabricated zero
  * values: the caller renders this instead of the data panels, not
- * alongside them.
+ * alongside them. `onRetry`, when given, renders a manual retry button
+ * -- available for both a scientific/config error and a backend
+ * failure that exhausted its bounded automatic retries.
  */
-export function DemoErrorState({ title, message }: { title: string; message: string }) {
+export function DemoErrorState({
+  title,
+  message,
+  onRetry,
+}: {
+  title: string;
+  message: string;
+  onRetry?: () => void;
+}) {
   return (
     <div
       role="alert"
@@ -13,6 +23,15 @@ export function DemoErrorState({ title, message }: { title: string; message: str
     >
       <p className="font-medium text-status-critical">{title}</p>
       <p className="mt-2 text-ink-secondary">{message}</p>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="mt-4 rounded-md border border-white/20 px-3 py-1.5 text-sm font-medium text-ink-primary hover:bg-white/5"
+        >
+          Retry
+        </button>
+      )}
     </div>
   );
 }

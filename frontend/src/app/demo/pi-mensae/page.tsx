@@ -6,12 +6,14 @@ import {
   DemoApiError,
   fetchDemoLightCurve,
   fetchDemoSummary,
+  isRetryableApiError,
   type DemoLightCurveResponse,
   type DemoSummaryResponse,
 } from "@/lib/api";
 import { StatTile } from "@/components/StatTile";
 import { DemoHeader } from "@/components/DemoHeader";
 import { DemoErrorState } from "@/components/DemoErrorState";
+import { BackendWakingNotice } from "@/components/BackendWakingNotice";
 import { PipelineStageList } from "@/components/PipelineStageList";
 import { LightCurveChart } from "@/components/LightCurveChart";
 import {
@@ -23,8 +25,18 @@ import {
 import { ProcessingHistory } from "@/components/ProcessingHistory";
 import { ScientificLimitations } from "@/components/ScientificLimitations";
 
+// Bounded auto-retry for the public deployment's cold-start experience:
+// a Render free-tier instance waking from sleep looks like a network
+// error (or an occasional 5xx) for up to roughly a minute, not a
+// permanent failure. Retrying forever, or too fast, would just create
+// unnecessary API traffic -- so this stops after MAX_AUTO_RETRY_MS and
+// hands control to a manual "Retry" button instead.
+export const RETRY_INTERVAL_MS = 5_000;
+export const MAX_AUTO_RETRY_MS = 60_000;
+
 type DemoState =
   | { kind: "loading" }
+  | { kind: "waking"; attempt: number }
   | { kind: "error"; title: string; message: string }
   | { kind: "loaded"; summary: DemoSummaryResponse; lightCurve: DemoLightCurveResponse };
 
@@ -51,12 +63,17 @@ function describeError(error: unknown): { title: string; message: string } {
 
 export default function PiMensaeDemoPage() {
   const [state, setState] = useState<DemoState>({ kind: "loading" });
+  const [retryToken, setRetryToken] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
+    const startedAt = Date.now();
 
-    async function load() {
-      setState({ kind: "loading" });
+    function wait(ms: number): Promise<void> {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function attempt(attemptNumber: number): Promise<void> {
       try {
         const [summary, lightCurve] = await Promise.all([
           fetchDemoSummary(),
@@ -66,17 +83,33 @@ export default function PiMensaeDemoPage() {
           setState({ kind: "loaded", summary, lightCurve });
         }
       } catch (error) {
-        if (!cancelled) {
-          setState({ kind: "error", ...describeError(error) });
+        if (cancelled) {
+          return;
         }
+        const elapsed = Date.now() - startedAt;
+        if (isRetryableApiError(error) && elapsed < MAX_AUTO_RETRY_MS) {
+          setState({ kind: "waking", attempt: attemptNumber });
+          await wait(RETRY_INTERVAL_MS);
+          if (!cancelled) {
+            await attempt(attemptNumber + 1);
+          }
+          return;
+        }
+        setState({ kind: "error", ...describeError(error) });
       }
     }
 
-    void load();
+    void attempt(1);
+
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [retryToken]);
+
+  function handleRetry() {
+    setState({ kind: "loading" });
+    setRetryToken((token) => token + 1);
+  }
 
   return (
     <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-8 px-6 py-12">
@@ -98,7 +131,13 @@ export default function PiMensaeDemoPage() {
         </p>
       )}
 
-      {state.kind === "error" && <DemoErrorState title={state.title} message={state.message} />}
+      {state.kind === "waking" && (
+        <BackendWakingNotice attempt={state.attempt} onRetryNow={handleRetry} />
+      )}
+
+      {state.kind === "error" && (
+        <DemoErrorState title={state.title} message={state.message} onRetry={handleRetry} />
+      )}
 
       {state.kind === "loaded" && (
         <>

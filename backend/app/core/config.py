@@ -33,7 +33,12 @@ class Settings(BaseSettings):
     log_format: Literal["json", "console"] = "console"
 
     api_v1_prefix: str = "/api/v1"
-    cors_origins: list[str] = ["http://localhost:3000"]
+    cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    cors_origin_regex: str | None = None
+    """Optional regex for additionally allowed origins (e.g. Vercel preview
+    deployment URLs, which vary per-branch/PR). Unset by default -- CORS is a
+    browser-enforced policy, not an authentication mechanism, so this is kept
+    narrow and documented rather than defaulting to a broad pattern."""
 
     database_url: str = "postgresql+psycopg://exoplanet:exoplanet@localhost:5432/exoplanet_hunter"
 

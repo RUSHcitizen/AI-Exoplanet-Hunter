@@ -17,6 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+fits = [
+    "astropy>=6.1",
+]
 mast = [
     "astroquery>=0.4.7",
     "astropy>=6.1",

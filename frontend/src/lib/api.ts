@@ -224,3 +224,19 @@ export function fetchDemoSummary(): Promise<DemoSummaryResponse> {
 export function fetchDemoLightCurve(): Promise<DemoLightCurveResponse> {
   return fetchDemoJson<DemoLightCurveResponse>("/api/v1/demo/pi-mensae/light-curve");
 }
+
+/**
+ * True for failures that look like a temporarily unavailable backend --
+ * a network error (the classic signature of a Render free-tier instance
+ * still waking from sleep) or a 5xx response -- as opposed to a
+ * permanent scientific/configuration error (missing FITS file, invalid
+ * data) reported as a 4xx `DemoApiError`. Only retryable failures should
+ * ever be retried automatically; a 4xx is real information about the
+ * demo's state and must be shown, not silently retried away.
+ */
+export function isRetryableApiError(error: unknown): boolean {
+  if (error instanceof DemoApiError) {
+    return error.status >= 500;
+  }
+  return error instanceof ApiError;
+}

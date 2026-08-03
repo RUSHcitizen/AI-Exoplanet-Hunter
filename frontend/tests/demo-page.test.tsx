@@ -1,6 +1,9 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import PiMensaeDemoPage from "@/app/demo/pi-mensae/page";
+import PiMensaeDemoPage, {
+  MAX_AUTO_RETRY_MS,
+  RETRY_INTERVAL_MS,
+} from "@/app/demo/pi-mensae/page";
 
 const SUMMARY_FIXTURE = {
   identity: {
@@ -176,11 +179,22 @@ describe("PiMensaeDemoPage", () => {
     expect(screen.getByRole("status")).toHaveTextContent(/loading/i);
   });
 
-  it("shows a backend-error state when the backend is unreachable", async () => {
+  it("shows a backend-error state when the backend stays unreachable past the bounded retry window", async () => {
+    // A network error is treated as a possibly-waking backend and
+    // auto-retried (see the "public cold-start experience" tests below)
+    // -- this asserts the permanent fallback once that bounded window
+    // elapses with no success.
+    vi.useFakeTimers();
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
     render(<PiMensaeDemoPage />);
-    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(MAX_AUTO_RETRY_MS + RETRY_INTERVAL_MS * 2);
+    });
+
+    expect(screen.getByRole("alert")).toBeInTheDocument();
     expect(screen.getByText(/backend unavailable/i)).toBeInTheDocument();
+    vi.useRealTimers();
   });
 
   it("renders real summary values from the mocked API response", async () => {
@@ -246,5 +260,116 @@ describe("PiMensaeDemoPage", () => {
         screen.getByText("Statistical high outlier — not a planet candidate"),
       ).toBeInTheDocument(),
     );
+  });
+
+  describe("public cold-start experience", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("shows a waking notice on a network error, then recovers automatically", async () => {
+      vi.useFakeTimers();
+      let callCount = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          callCount += 1;
+          if (callCount <= 2) {
+            throw new Error("network down");
+          }
+          const url = String(input);
+          if (url.endsWith("/light-curve")) {
+            return { ok: true, json: async () => LIGHT_CURVE_FIXTURE } as Response;
+          }
+          return { ok: true, json: async () => SUMMARY_FIXTURE } as Response;
+        }),
+      );
+
+      render(<PiMensaeDemoPage />);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByRole("status", { name: /waking the science backend/i })).toBeInTheDocument();
+      // Never substitutes fabricated data while waking.
+      expect(screen.queryByText("20,076")).not.toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RETRY_INTERVAL_MS);
+      });
+
+      expect(screen.getByText("20,076")).toBeInTheDocument();
+    });
+
+    it("does not auto-retry a permanent scientific-data error (404)", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            ({
+              ok: false,
+              status: 404,
+              json: async () => ({
+                detail: { error: "demo_fits_missing", message: "File not present." },
+              }),
+            }) as unknown as Response,
+        ),
+      );
+
+      render(<PiMensaeDemoPage />);
+      await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+      expect(screen.getByText(/demo fits file missing/i)).toBeInTheDocument();
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+
+    it("stops automatic retries after the bounded duration and offers a manual retry button", async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new Error("still down");
+        }),
+      );
+
+      render(<PiMensaeDemoPage />);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MAX_AUTO_RETRY_MS + RETRY_INTERVAL_MS * 2);
+      });
+
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    });
+
+    it("manual retry button succeeds once the backend responds", async () => {
+      let shouldFail = true;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          if (shouldFail) {
+            return {
+              ok: false,
+              status: 404,
+              json: async () => ({
+                detail: { error: "demo_fits_missing", message: "File not present." },
+              }),
+            } as unknown as Response;
+          }
+          const url = String(input);
+          if (url.endsWith("/light-curve")) {
+            return { ok: true, json: async () => LIGHT_CURVE_FIXTURE } as Response;
+          }
+          return { ok: true, json: async () => SUMMARY_FIXTURE } as Response;
+        }),
+      );
+
+      render(<PiMensaeDemoPage />);
+      await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+
+      shouldFail = false;
+      fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+
+      expect(await screen.findByText("20,076")).toBeInTheDocument();
+    });
   });
 });

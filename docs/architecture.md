@@ -1146,13 +1146,234 @@ against a locally running server.
   on Vitest/React Testing Library assertions, `tsc --noEmit`, ESLint,
   a production `next build`, and manual browser verification.
 
+## Current status: Phase 4B (Public read-only deployment)
+
+This is the second slice of roadmap phase 4: taking the completed
+Phase 4A local dashboard public, without adding any new scientific
+processing, any database, any accounts, or any path that accepts an
+upload or an arbitrary target. It adds infrastructure only.
+
+```text
+Public browser
+        | HTTPS
+Vercel (Next.js frontend, frontend/ as project root)
+        | HTTPS API calls
+Render (FastAPI backend, backend/ as root directory, Docker runtime)
+        | read-only
+Verified Pi Mensae FITS file baked into the backend image at build time
+```
+
+### Why Vercel and Render
+
+- **Vercel** builds and hosts the Next.js frontend directly from this
+  GitHub repository's `master` branch, with `frontend` as the project
+  root; it needs no configuration beyond `NEXT_PUBLIC_API_URL` and
+  matches the project's existing `output: "standalone"` Next.js build.
+- **Render** was chosen for the backend specifically because the
+  project already ships `backend/Dockerfile`: Render's Docker runtime
+  runs that image directly, so the exact reproducible scientific
+  environment (Python 3.12, `uv`-pinned dependencies) that already
+  exists for local development and CI is what serves the public API,
+  with no separate deployment-specific dependency file to keep in
+  sync.
+- Neither host requires a database, a persistent disk, or background
+  workers for this milestone, which matches the actual requirement:
+  one fixed, read-only demonstration with no runtime state.
+
+### Build-time FITS provisioning
+
+`data/` is gitignored (see `.gitignore`) -- the Pi Mensae FITS file
+used throughout every Phase 3A-4A real-data check is a local cache,
+not a source file, so it is never committed to git. The deployed image
+instead fetches it once, during `docker build`, via
+`backend/app/deploy/provision_demo_fits.py` (invoked by
+`backend/Dockerfile` as `python -m app.deploy.provision_demo_fits`):
+
+1. Downloads from a **fixed** NASA/MAST "Direct Object Access" URL
+   (`https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:TESS/product/tess2018206045859-s0001-0000000261136679-0120-s_lc.fits`)
+   -- there is no environment variable, CLI argument, or request
+   parameter that can point it anywhere else.
+2. Streams the response to a temporary file in the destination
+   directory (never assumes the file is small), computing its SHA-256
+   while streaming.
+3. Verifies the checksum against the exact value recorded in this
+   document's Phase 3A real-data sanity check --
+   `1eecffff3afa7e8c4ad763b6907e62447bacf339968292d86be45acd9bf1d609`
+   -- and, when given, the known size (2,039,040 bytes).
+4. Only on a full match does it atomically install the file
+   (`os.replace`) at its final path; any failure removes the temporary
+   file and raises, which fails the `docker build` step rather than
+   shipping unverified or partial data.
+5. Is idempotent: an existing file at the destination that already
+   matches the expected checksum is reused without a network request;
+   one that doesn't match is replaced under the exact same
+   verification.
+
+This never runs from a running server process or an HTTP request --
+only from `docker build` -- so there is no code path by which a public
+request could trigger a NASA download. The deployed service also
+performs no runtime filesystem writes and relies on no persistent
+disk: the embedded file is part of the image itself, and a fresh
+container from the same image always starts with the identical,
+already-verified file.
+
+`Settings.pi_mensae_demo_fits_path`'s existing default
+(`../data/raw/tess/sector_001/<filename>`, resolved from the
+container's `/app` working directory to `/data/raw/tess/sector_001/<filename>`)
+already matches the provisioning script's destination and Docker
+Compose's existing `./data:/data` bind mount, so no path override is
+needed between local development and the deployed image.
+
+Tests (`backend/tests/test_provision_demo_fits.py`) inject a fake
+downloader and never make a real network call; a correct payload,
+an incorrect checksum, an incorrect size, a non-200 status, an
+already-valid cached file, and an already-invalid cached file are all
+covered. No test in the default suite contacts NASA/MAST.
+
+### CORS decision
+
+CORS is a **browser-enforced** policy, not an authentication boundary
+-- this API has no cookies, no sessions, and no credentialed requests,
+so `allow_credentials=False` (changed from Phase 1-4A's
+`allow_credentials=True`, which was never actually needed). Allowed
+origins come from `Settings.cors_origins` (default: `http://localhost:3000`
+and `http://127.0.0.1:3000`), overridable via the `CORS_ORIGINS`
+environment variable (a JSON array); an optional
+`Settings.cors_origin_regex` / `CORS_ORIGIN_REGEX` exists only for the
+case where Vercel preview-deployment URLs (which vary per branch/PR)
+must also reach the backend, and is unset by default. `allow_origins=["*"]`
+is never combined with credentials. See `backend/tests/test_cors.py`
+for the exact allow/deny behavior and confirmation that CORS
+configuration never changes a response body.
+
+### Render configuration
+
+`render.yaml` (repository root) is a Render Blueprint for one web
+service, `ai-exoplanet-hunter-api`:
+
+- `runtime: docker`, `branch: master`, `rootDir: backend` (so
+  `backend/Dockerfile` is built with `backend/` as the Docker context
+  -- everything the provisioning script needs already lives there, so
+  no repository-root Docker context was needed).
+- `plan: free`, `healthCheckPath: /api/v1/health`, `autoDeploy: true`.
+- `envVars`: `ENVIRONMENT=production`, `LOG_FORMAT=json`, and
+  `CORS_ORIGINS` (starts as the local-dev origins; updated to the
+  exact Vercel production URL once known -- see "Final production
+  CORS" below).
+- No database, no persistent disk, no background worker.
+
+`backend/Dockerfile`'s `CMD` was changed to shell form
+(`uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}`) so it
+binds Render's injected `PORT` at runtime while still defaulting to
+`8000` locally (matching the existing `EXPOSE 8000` and Docker
+Compose's `8000:8000` mapping, so local development is unaffected).
+
+### Frontend configuration
+
+The Vercel project's root directory is `frontend`, production branch
+`master`. `NEXT_PUBLIC_API_URL` is a Vercel environment variable set to
+the final Render HTTPS URL -- **never** hard-coded into source, since
+Next.js inlines `NEXT_PUBLIC_*` variables into the browser bundle at
+build time (the same reason `frontend/Dockerfile` already takes it as
+a build `ARG`). Changing this variable in Vercel requires a new
+deployment (redeploy from the Vercel dashboard, or push a new commit)
+before it takes effect -- Vercel does not hot-reload environment
+variables into an already-built bundle.
+
+### Cold-start behavior
+
+Render's free instance type sleeps when idle and can take up to
+roughly a minute to wake on the next request. The demo page
+(`frontend/src/app/demo/pi-mensae/page.tsx`) treats a network error or
+a `5xx` response as "possibly waking" (`isRetryableApiError` in
+`src/lib/api.ts`) and automatically retries every 5 seconds for up to
+60 seconds (`RETRY_INTERVAL_MS` / `MAX_AUTO_RETRY_MS`), showing
+`BackendWakingNotice` ("Waking the science backend. This can take up
+to about one minute on the free demonstration service.") rather than a
+blank page or a fabricated zero value. After the bounded window, or
+immediately for a permanent `4xx` scientific/configuration error (a
+missing FITS file, invalid data), the page shows the existing
+`DemoErrorState` with a manual "Retry" button -- a scientific error is
+never auto-retried indefinitely, since retrying it can't change the
+answer.
+
+### Security headers
+
+`frontend/next.config.ts` adds `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: strict-origin-when-cross-origin`, and
+`X-Frame-Options: DENY` to every route. A Content-Security-Policy was
+deliberately not added: the canvas-based light-curve chart and
+Next.js's own runtime bootstrap script would need a carefully tuned
+CSP that hasn't been written or tested, and shipping an untested CSP
+risks silently breaking the chart -- worse than shipping none.
+
+### What Phase 4B does not add
+
+No detrending, transit search, Box Least Squares, candidate ranking,
+or machine learning (unchanged from Phase 4A); no PostgreSQL, Redis,
+object storage, Celery, background workers, or queues; no user
+accounts, authentication, file uploads, arbitrary-path or
+arbitrary-target processing; no write endpoint of any kind. The public
+API surface is exactly the same two read-only Phase 4A endpoints plus
+the existing health check.
+
+### Public URLs
+
+- Public dashboard: see the root `README.md`'s Phase 4B entry for the
+  current live Vercel URL (filled in once deployed; this document does
+  not duplicate a URL that can change on redeploy).
+- Public backend health check: `<Render URL>/api/v1/health`.
+
+### Rollback procedure
+
+- **Render**: open the service's "Deploys" tab and roll back to the
+  preceding successful deploy, or push a revert commit to `master`
+  (auto-deploy will build it). Automatic deploys can be paused from
+  the service's Settings without deleting the service.
+- **Vercel**: open the project's "Deployments" tab and promote a
+  previous deployment to Production, or revert the commit on `master`.
+- **Disabling the public demo**: pause auto-deploy (or suspend/delete
+  the Render service) and remove or unpublish the Vercel project;
+  removing `NEXT_PUBLIC_API_URL` alone is not sufficient, since the
+  frontend would fall back to a localhost URL the public browser can't
+  reach, which is a broken state, not a disabled one.
+- **Revoking GitHub integration**: remove repository access from the
+  Render and Vercel GitHub App installations in each platform's
+  account settings; this stops both future auto-deploys immediately.
+- **Verifying removal**: after suspending or deleting a service,
+  confirm its URL returns a host-level error (DNS failure or platform
+  "not found" page) rather than a stale successful response.
+
+### Known limitations of Phase 4B
+
+- The free Render instance type sleeps when idle; the first public
+  request after a period of inactivity can take up to roughly a
+  minute, mitigated but not eliminated by the frontend's bounded retry.
+- The Render free plan has no SLA and may be reclaimed or rate-limited
+  by the platform; this deployment is a demonstration, not a
+  production service.
+- CORS is a browser convenience, not an authentication boundary: the
+  API itself is, and is intended to be, fully public and read-only --
+  anyone can call it directly (e.g. with `curl`) regardless of CORS
+  configuration.
+- No Content-Security-Policy is set (see "Security headers" above);
+  only low-risk, framework-agnostic headers are applied.
+- The provisioning script's build-time NASA/MAST fetch means every
+  fresh image build requires network access at build time; a fully
+  air-gapped build is out of scope for this milestone.
+- Vercel preview-deployment URLs are not permitted through CORS by
+  default (`Settings.cors_origin_regex` is unset); enabling them for a
+  given branch/PR is a deliberate, documented opt-in, not automatic.
+
 ## Known limitations of this milestone
 
-- The backend Docker image installs only core web-service dependencies.
-  The `mast` (astroquery, astropy), `science` (Lightkurve, ...), and `ml`
-  (PyTorch, scikit-learn) extras are deliberately deferred to the phases
-  that use them, to avoid multi-gigabyte builds with no corresponding
-  functionality.
+- The backend Docker image installs core web-service dependencies plus
+  the small `fits` extra (astropy only), which `app/data/fits_parser.py`
+  needs to parse the Pi Mensae FITS file for the public Phase 4B demo
+  endpoints. The heavier `mast` (astroquery), `science` (Lightkurve,
+  ...), and `ml` (PyTorch, scikit-learn) extras are deliberately
+  deferred to the phases that use them at runtime, to avoid
+  multi-gigabyte builds with no corresponding functionality.
 - Postgres is provisioned but nothing reads from or writes to it yet --
   database models for search results arrive in a later phase.
 - The dashboard's mission-overview numbers are static placeholders; they

@@ -1,0 +1,36 @@
+# Render Blueprint for the public, read-only Pi Mensae backend
+# deployment (Phase 4B). See docs/architecture.md's "Phase 4B: Public
+# Read-Only Deployment" section for the full architecture, rationale,
+# and the manual steps this blueprint doesn't cover (Vercel frontend
+# import, and setting the final production CORS origin once the Vercel
+# URL is known).
+#
+# https://render.com/docs/blueprint-spec
+#
+# Deliberately not included: a database, a persistent disk, background
+# workers, or any private/authenticated service -- this backend is a
+# public, read-only API with one fixed scientific demonstration and no
+# runtime state.
+services:
+  - type: web
+    name: ai-exoplanet-hunter-api
+    runtime: docker
+    branch: master
+    rootDir: backend
+    plan: free
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_FORMAT
+        value: json
+      - key: CORS_ORIGINS
+        # Update once the Vercel production URL is known (see "Step C --
+        # Final production CORS" in docs/architecture.md), e.g.:
+        #   '["https://ai-exoplanet-hunter.vercel.app"]'
+        # Localhost origins are kept here as a safe starting value so the
+        # first deploy never fails closed; they do not expose anything,
+        # since CORS only affects which *browser* origins may read the
+        # response -- the API itself remains equally public either way.
+        value: '["http://localhost:3000", "http://127.0.0.1:3000"]'
