@@ -136,3 +136,22 @@ class NormalizationError(ProcessingError):
 class InvalidNormalizationConfigError(NormalizationError):
     """The supplied ``NormalizationConfig`` is not usable (e.g. a
     negative ``zero_reference_tolerance``)."""
+
+
+class OutlierDetectionError(ProcessingError):
+    """Base class for errors raised while flagging statistical outliers in
+    an already normalized light curve (Phase 3D).
+
+    A segment whose finite-value count or robust scale makes per-cadence
+    scoring untrustworthy is **not** one of these errors -- that is
+    recorded per segment as an ``OutlierAnalysisStatus`` instead, so one
+    unanalyzable segment never blocks the others. This class is reserved
+    for conditions that make the whole run unusable (an invalid config,
+    or a structurally malformed segment)."""
+
+
+class InvalidOutlierDetectionConfigError(OutlierDetectionError):
+    """The supplied ``OutlierDetectionConfig`` is not usable (e.g. a
+    nonpositive ``upper_threshold``, a nonpositive ``lower_threshold``
+    when enabled, a non-positive ``minimum_finite_cadences``, or a
+    negative ``minimum_robust_scale``)."""

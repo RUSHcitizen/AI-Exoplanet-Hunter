@@ -122,6 +122,67 @@ cadence is still reported either way; nothing is ever removed. See
 [`docs/architecture.md`](docs/architecture.md#current-status-phase-3c-per-segment-flux-normalization)
 for the full rule, error propagation, and known limitations.
 
+**Phase 3D: Robust per-segment outlier flagging** -- complete. Filter,
+segment, normalize, then independently score each segment's normalized
+flux for statistically unusual values -- this is a flagging stage, not a
+removal stage: no cadence is ever deleted, replaced, interpolated, or
+reordered:
+
+```bash
+cd backend
+python -m app.cli flag-outliers data/raw/tess/sector_001/<filename>.fits
+python -m app.cli flag-outliers <path>.fits --upper-threshold 4.0
+python -m app.cli flag-outliers <path>.fits --lower-threshold 5.0
+```
+
+For each segment, independently, using only that segment's own finite
+`normalized_flux` values:
+
+```text
+center       = median(finite normalized flux values)
+MAD          = median(abs(value - center))
+robust_scale = 1.4826 * MAD
+robust_score = (value - center) / robust_scale
+```
+
+`1.4826` is the conventional Gaussian-consistency scaling factor for MAD
+(it makes `robust_scale` an unbiased estimator of the standard deviation
+*if* the underlying distribution were exactly Gaussian). TESS photometric
+noise is not assumed to be Gaussian -- the factor is used only as a
+documented, deterministic convention, the same way Lightkurve and other
+pipelines use it.
+
+A value is a **high outlier** when `robust_score > upper_threshold`
+(default `5.0`, always active). A value is a **low outlier** only when
+`--lower-threshold` is explicitly set and `robust_score < -lower_threshold`.
+Threshold equality is never flagged (strict comparison only).
+
+**Downward (low-side) detection is disabled by default.** A real
+planetary transit is itself a downward brightness change, so a generic
+two-sided clipping rule would erase exactly the signal this project
+searches for. Enabling `--lower-threshold` is possible for diagnostic
+use, but the CLI prints an explicit warning that any resulting low-side
+flags may include real transit-like signal, not just instrumental
+artifacts -- it is not the project default.
+
+Every segment is classified with an explicit status: `VALID` (enough
+finite values and a usable robust scale -- flagging was performed),
+`INSUFFICIENT_DATA` (fewer finite values than
+`--minimum-finite-cadences`), `ZERO_SCALE` (a constant or near-constant
+segment whose robust scale is unusable), or `NORMALIZATION_UNAVAILABLE`
+(Phase 3C could not normalize this segment). A nonfinite normalized-flux
+value is never scored or flagged as a statistical outlier; it instead
+gets its own traceable record by default. Every cadence keeps an
+aligned mask entry regardless of status, and every flag is traceable
+back to its original TIME and FITS source-row index. See
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-3d-robust-per-segment-outlier-flagging)
+for the full method, status semantics, and known limitations.
+
+**Explicitly not implemented by Phase 3D:** cadence removal, clipping,
+flux replacement, interpolation, smoothing, detrending, transit
+detection, Box Least Squares, machine learning, or website/database
+integration.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -212,7 +273,8 @@ frontend independently.
 3. Light-curve preprocessing pipeline.
    - **3A: quality and finite-value filtering** -- done.
    - **3B: gap detection and contiguous segmentation** -- done.
-   - **3C: per-segment flux normalization** -- done (this milestone).
+   - **3C: per-segment flux normalization** -- done.
+   - **3D: robust per-segment outlier flagging** -- done (this milestone).
 4. Transit-search engine (Box Least Squares + pluggable interface).
 5. Physical property estimation.
 6. Synthetic planetary system generator.

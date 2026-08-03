@@ -4,8 +4,9 @@ Run with ``python -m app.cli <command> ...``. Phase 2A implements TESS
 target/observation discovery; Phase 2B adds downloading and parsing one
 selected light-curve product; Phase 3A adds quality and finite-value
 filtering; Phase 3B adds gap detection and contiguous segmentation;
-Phase 3C adds per-segment median-ratio flux normalization. No sigma
-clipping, detrending, transit search, or ML happens here yet. See
+Phase 3C adds per-segment median-ratio flux normalization; Phase 3D adds
+robust per-segment statistical outlier *flagging* (never removal). No
+detrending, transit search, or ML happens here yet. See
 ``docs/architecture.md`` for the full roadmap.
 """
 
@@ -35,12 +36,16 @@ from app.data.models import (
     GapDetectionConfig,
     NormalizationConfig,
     NormalizedLightCurve,
+    OutlierDetectionConfig,
+    OutlierDetectionStep,
+    OutlierFlaggedLightCurve,
     RawLightCurve,
     SegmentedLightCurve,
     TargetSearchResult,
     config_from_policy_name,
 )
 from app.data.normalization import normalize_light_curve
+from app.data.outlier_detection import flag_outliers
 from app.data.product_selection import select_product
 from app.data.quality_filter import filter_quality
 from app.data.quality_flags import QUALITY_BIT_TABLE, QualityPolicy
@@ -282,6 +287,118 @@ def _build_parser() -> argparse.ArgumentParser:
             "A segment's median reference at or below this magnitude is treated as "
             "zero_reference and left un-normalized (default: 0.0, exact zero only)."
         ),
+    )
+
+    flag_parser = subparsers.add_parser(
+        "flag-outliers",
+        help=(
+            "Filter, segment, normalize, then flag statistically unusual normalized flux "
+            "values per segment (flags cadences; never removes, replaces, or reorders one)."
+        ),
+    )
+    flag_parser.add_argument("fits_path", help="Path to a cached TESS light-curve FITS file.")
+    flag_parser.add_argument(
+        "--quality-policy",
+        default=QualityPolicy.MAST.value,
+        choices=[policy.value for policy in QualityPolicy],
+        help="Named quality-bitmask policy applied before segmentation (default: mast).",
+    )
+    flag_parser.add_argument(
+        "--quality-bitmask",
+        type=int,
+        default=None,
+        help="Custom integer bitmask; requires --quality-policy custom.",
+    )
+    flag_parser.add_argument(
+        "--allow-nonfinite-time",
+        action="store_true",
+        help="Do not reject cadences whose TIME is NaN or infinite.",
+    )
+    flag_parser.add_argument(
+        "--allow-nonfinite-flux",
+        action="store_true",
+        help="Do not reject cadences whose flux is NaN or infinite.",
+    )
+    flag_parser.add_argument(
+        "--allow-nonfinite-flux-err",
+        action="store_true",
+        help="Do not reject cadences whose flux error is NaN or infinite.",
+    )
+    flag_parser.add_argument(
+        "--gap-multiplier",
+        type=float,
+        default=GapDetectionConfig().gap_multiplier,
+        help="An interval exceeding nominal_cadence * multiplier is a gap (default: 5.0).",
+    )
+    flag_parser.add_argument(
+        "--gap-tolerance",
+        type=float,
+        default=GapDetectionConfig().gap_tolerance,
+        help="Absolute floating-point tolerance added to the gap threshold, in days.",
+    )
+    flag_parser.add_argument(
+        "--cadence-disagreement-fraction",
+        type=float,
+        default=GapDetectionConfig().cadence_disagreement_fraction,
+        help="Fractional difference above which measured/metadata cadence are flagged disagreeing.",
+    )
+    flag_parser.add_argument(
+        "--missing-cadence-residual-tolerance",
+        type=float,
+        default=GapDetectionConfig().missing_cadence_residual_tolerance,
+        help="How close a gap's interval must be to an integer cadence multiple to be estimated.",
+    )
+    flag_parser.add_argument(
+        "--zero-reference-tolerance",
+        type=float,
+        default=NormalizationConfig().zero_reference_tolerance,
+        help=(
+            "A segment's median reference at or below this magnitude is treated as "
+            "zero_reference and left un-normalized (default: 0.0, exact zero only)."
+        ),
+    )
+    flag_parser.add_argument(
+        "--upper-threshold",
+        type=float,
+        default=OutlierDetectionConfig().upper_threshold,
+        help=(
+            "A finite normalized value with robust_score > this is a high (positive-spike) "
+            "outlier (default: 5.0). Always active -- cannot be disabled."
+        ),
+    )
+    flag_parser.add_argument(
+        "--lower-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Enable low (downward) outlier detection: a finite normalized value with "
+            "robust_score < -LOWER_THRESHOLD is flagged. DISABLED BY DEFAULT. WARNING: a real "
+            "planetary transit is itself a downward brightness change -- enabling this can flag "
+            "possible transits, not just instrumental artifacts."
+        ),
+    )
+    flag_parser.add_argument(
+        "--minimum-finite-cadences",
+        type=int,
+        default=OutlierDetectionConfig().minimum_finite_cadences,
+        help=(
+            "A segment needs at least this many finite normalized-flux values before its "
+            "median/MAD are trusted enough to score anything against (default: 5)."
+        ),
+    )
+    flag_parser.add_argument(
+        "--minimum-robust-scale",
+        type=float,
+        default=OutlierDetectionConfig().minimum_robust_scale,
+        help=(
+            "A segment's robust scale (1.4826 * MAD) must exceed this to be trusted for "
+            "scoring (default: 0.0, exact zero only)."
+        ),
+    )
+    flag_parser.add_argument(
+        "--no-flag-nonfinite-normalized-flux",
+        action="store_true",
+        help="Do not record a detailed flag for nonfinite normalized-flux positions.",
     )
 
     return parser
@@ -791,6 +908,141 @@ def run_normalize_light_curve(
     return _EXIT_OK
 
 
+def format_flag_outliers_result(flagged: OutlierFlaggedLightCurve) -> str:
+    """Render an ``OutlierFlaggedLightCurve`` as a human-readable report."""
+    stats = flagged.stats
+    step = flagged.history[-1]
+    assert isinstance(step, OutlierDetectionStep)  # this stage always appends one last
+    prov = flagged.provenance
+    lower_enabled = step.config.lower_threshold is not None
+    lines = [
+        f"Source file:              {prov.source_filename}",
+        f"Target (TIC):             {prov.tic_id if prov.tic_id is not None else 'unknown'}",
+        f"Sector:                   {prov.sector if prov.sector is not None else 'unknown'}",
+        f"Flux column:              {flagged.flux_column}",
+        f"Total cadences:           {stats.total_cadences}",
+        f"Segments:                 {stats.segment_count}",
+        f"Analyzed segments:        {stats.analyzed_segment_count}",
+        f"Upper threshold:          {step.config.upper_threshold}",
+        "Lower threshold:          "
+        + (
+            f"{step.config.lower_threshold} (ENABLED -- may flag transits)"
+            if lower_enabled
+            else "disabled (default)"
+        ),
+        f"High (positive) outliers: {stats.total_high_outliers}",
+        f"Low (negative) outliers:  {stats.total_low_outliers}",
+        f"Nonfinite flagged:        {stats.total_nonfinite_flagged}",
+    ]
+
+    if stats.unanalyzed_by_status:
+        lines.append("")
+        lines.append("Segments not analyzed, by status:")
+        for status, count in sorted(
+            stats.unanalyzed_by_status.items(), key=lambda item: item[0].value
+        ):
+            lines.append(f"  - {status.value}: {count}")
+
+    lines.append("")
+    lines.append("Segments:")
+    for entry in flagged.segments:
+        segment = entry.normalized.segment
+        lines.append(
+            f"  #{segment.segment_number}: positions {segment.start_position}-"
+            f"{segment.end_position} (source rows {segment.start_source_index}-"
+            f"{segment.end_source_index}), {segment.cadence_count} cadences, "
+            f"status={entry.stats.status.value}, high={entry.stats.high_outlier_count}, "
+            f"low={entry.stats.low_outlier_count}, nonfinite={entry.stats.nonfinite_flagged_count}"
+        )
+
+    lines.extend(
+        [
+            "",
+            f"Gaps carried through unchanged: {len(flagged.gaps)}",
+            f"Code version:        {step.code_version}",
+            f"Source SHA-256:      {prov.source_checksum_sha256}",
+            "The source FITS file was not modified.",
+            "No cadence was removed, replaced, interpolated, or reordered -- this is a "
+            "flagging stage only.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def run_flag_outliers(
+    fits_path: str,
+    *,
+    quality_policy: str = QualityPolicy.MAST.value,
+    quality_bitmask: int | None = None,
+    allow_nonfinite_time: bool = False,
+    allow_nonfinite_flux: bool = False,
+    allow_nonfinite_flux_err: bool = False,
+    gap_multiplier: float = GapDetectionConfig().gap_multiplier,
+    gap_tolerance: float = GapDetectionConfig().gap_tolerance,
+    cadence_disagreement_fraction: float = GapDetectionConfig().cadence_disagreement_fraction,
+    missing_cadence_residual_tolerance: float = (
+        GapDetectionConfig().missing_cadence_residual_tolerance
+    ),
+    zero_reference_tolerance: float = NormalizationConfig().zero_reference_tolerance,
+    upper_threshold: float = OutlierDetectionConfig().upper_threshold,
+    lower_threshold: float | None = None,
+    minimum_finite_cadences: int = OutlierDetectionConfig().minimum_finite_cadences,
+    minimum_robust_scale: float = OutlierDetectionConfig().minimum_robust_scale,
+    flag_nonfinite_normalized_flux: bool = True,
+) -> int:
+    """Run the ``flag-outliers`` command; returns a process exit code."""
+    path = Path(fits_path)
+    if not path.is_file():
+        print(f"FITS file not found: {fits_path}", file=sys.stderr)
+        return _EXIT_FITS_ERROR
+
+    try:
+        quality_config = config_from_policy_name(
+            quality_policy,
+            custom_quality_bitmask=quality_bitmask,
+            require_finite_time=not allow_nonfinite_time,
+            require_finite_flux=not allow_nonfinite_flux,
+            require_finite_flux_err=not allow_nonfinite_flux_err,
+        )
+        gap_config = GapDetectionConfig(
+            gap_multiplier=gap_multiplier,
+            gap_tolerance=gap_tolerance,
+            cadence_disagreement_fraction=cadence_disagreement_fraction,
+            missing_cadence_residual_tolerance=missing_cadence_residual_tolerance,
+        )
+        normalization_config = NormalizationConfig(
+            zero_reference_tolerance=zero_reference_tolerance
+        )
+        outlier_config = OutlierDetectionConfig(
+            upper_threshold=upper_threshold,
+            lower_threshold=lower_threshold,
+            minimum_finite_cadences=minimum_finite_cadences,
+            minimum_robust_scale=minimum_robust_scale,
+            flag_nonfinite_normalized_flux=flag_nonfinite_normalized_flux,
+        )
+    except ProcessingError as exc:
+        print(f"Invalid configuration: {exc}", file=sys.stderr)
+        return _EXIT_PROCESSING_ERROR
+
+    try:
+        light_curve = parse_light_curve(path)
+    except FitsError as exc:
+        print(f"Invalid FITS file: {exc}", file=sys.stderr)
+        return _EXIT_FITS_ERROR
+
+    try:
+        filtered = filter_quality(light_curve, quality_config)
+        segmented = segment_light_curve(filtered, gap_config)
+        normalized = normalize_light_curve(segmented, normalization_config)
+        flagged = flag_outliers(normalized, outlier_config)
+    except ProcessingError as exc:
+        print(f"Processing error: {exc}", file=sys.stderr)
+        return _EXIT_PROCESSING_ERROR
+
+    print(format_flag_outliers_result(flagged))
+    return _EXIT_OK
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(get_settings())
     parser = _build_parser()
@@ -844,6 +1096,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             cadence_disagreement_fraction=args.cadence_disagreement_fraction,
             missing_cadence_residual_tolerance=args.missing_cadence_residual_tolerance,
             zero_reference_tolerance=args.zero_reference_tolerance,
+        )
+    if args.command == "flag-outliers":
+        return run_flag_outliers(
+            args.fits_path,
+            quality_policy=args.quality_policy,
+            quality_bitmask=args.quality_bitmask,
+            allow_nonfinite_time=args.allow_nonfinite_time,
+            allow_nonfinite_flux=args.allow_nonfinite_flux,
+            allow_nonfinite_flux_err=args.allow_nonfinite_flux_err,
+            gap_multiplier=args.gap_multiplier,
+            gap_tolerance=args.gap_tolerance,
+            cadence_disagreement_fraction=args.cadence_disagreement_fraction,
+            missing_cadence_residual_tolerance=args.missing_cadence_residual_tolerance,
+            zero_reference_tolerance=args.zero_reference_tolerance,
+            upper_threshold=args.upper_threshold,
+            lower_threshold=args.lower_threshold,
+            minimum_finite_cadences=args.minimum_finite_cadences,
+            minimum_robust_scale=args.minimum_robust_scale,
+            flag_nonfinite_normalized_flux=not args.no_flag_nonfinite_normalized_flux,
         )
 
     parser.error(f"Unknown command: {args.command}")

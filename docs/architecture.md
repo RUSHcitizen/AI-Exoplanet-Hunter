@@ -778,6 +778,217 @@ with no omission or duplication; `gaps` was identical to Phase 3B's own
 output; and two runs on the same input produced byte-identical
 `model_dump_json()` output.
 
+## Current status: Phase 3D (Robust per-segment outlier flagging)
+
+This is the `Sigma clipping (per-segment outlier rejection)` stage of the
+data flow above -- the fourth slice of roadmap phase 3, and the
+non-destructive half of it: it takes a `NormalizedLightCurve` and
+independently analyzes each `NormalizedSegment`'s own finite
+`normalized_flux` values for statistically unusual measurements, then
+attaches transparent, traceable flags. It never deletes, replaces,
+interpolates, or reorders a cadence -- every cadence that enters this
+stage leaves it, in the same order, with the same values. Later stages
+remain free to decide whether or how to use the flags; nothing here
+commits to excluding a cadence from anything.
+
+Implemented:
+- `app/data/outlier_detection.py` -- `flag_outliers(normalized, config)`,
+  a pure function from a `NormalizedLightCurve` plus an
+  `OutlierDetectionConfig` to a new `OutlierFlaggedLightCurve`.
+- New typed models (`app/data/models.py`): `OutlierDirection`,
+  `OutlierAnalysisStatus`, `OutlierReason`, `OutlierDetectionConfig`,
+  `FlaggedCadence`, `SegmentOutlierStats`, `OutlierFlaggedSegment`,
+  `OutlierDetectionStats`, `OutlierDetectionStep`,
+  `OutlierFlaggedLightCurve`.
+- New exceptions (`app/data/exceptions.py`): `OutlierDetectionError`,
+  `InvalidOutlierDetectionConfigError`.
+- `app/cli.py` -- a `flag-outliers` command that filters, segments,
+  normalizes, and flags in one step:
+
+```bash
+python -m app.cli flag-outliers <path>.fits                          # mast policy, default config
+python -m app.cli flag-outliers <path>.fits --upper-threshold 4.0
+python -m app.cli flag-outliers <path>.fits --lower-threshold 5.0     # diagnostic only -- see below
+python -m app.cli flag-outliers <path>.fits --no-flag-nonfinite-normalized-flux
+```
+
+  It reports total cadences, segment/analyzed counts, a per-status
+  breakdown of any segment not analyzed, high/low/nonfinite-flagged
+  totals, a per-segment status and count line, the code version, and
+  the source checksum.
+
+Explicitly not implemented: automatic cadence removal, two-sided
+clipping by default, detrending, smoothing, spline fitting, Gaussian
+processes, interpolation, gap filling, sector stitching, transit search,
+Box Least Squares, feature extraction, machine learning, database
+persistence, or dashboard/API integration.
+
+### Statistical method
+
+For each `NormalizedSegment`, independently, using only that segment's
+own finite `normalized_flux` values:
+
+```
+center       = median(finite normalized flux values)
+MAD          = median(abs(value - center))
+robust_scale = 1.4826 * MAD
+robust_score = (value - center) / robust_scale
+```
+
+`1.4826` is the conventional Gaussian-consistency scaling factor for
+MAD: it makes `robust_scale` an unbiased estimator of the standard
+deviation *if* the underlying distribution were exactly Gaussian. TESS
+photometric noise is not claimed to be Gaussian -- the factor is used
+only as a documented, deterministic convention, the same way Lightkurve
+and other pipelines use it. Median and MAD are used instead of mean and
+standard deviation for the same robustness reason Phase 3B and 3C use a
+median: a handful of outlying values (including a real transit) cannot
+move either statistic by more than its own breakdown point allows.
+
+This module never crosses a gap or mixes segments: each segment's
+`center`/`MAD`/`robust_scale` are computed only from that segment's own
+`normalized_flux` tuple, the same guarantee `app.data.normalization`
+makes for the segment reference.
+
+### Default policy
+
+- `upper_threshold = 5.0` -- a finite normalized value is a **high
+  outlier** when `robust_score > upper_threshold`. High-side (positive
+  spike) detection is always active and cannot be disabled, since a
+  positive spike (cosmic ray, momentum-dump artifact, etc.) can never be
+  mistaken for a transit.
+- `lower_threshold = None` -- **downward detection is disabled by
+  default.** A finite normalized value is a **low outlier** only when
+  `lower_threshold` is explicitly set (to a finite, strictly positive
+  value) and `robust_score < -lower_threshold`.
+- Threshold comparison is strict in both directions: a `robust_score`
+  exactly equal to `upper_threshold` or exactly equal to
+  `-lower_threshold` is never flagged, verified directly by
+  `test_score_at_or_just_below_upper_threshold_is_not_an_outlier` and
+  `test_score_just_above_upper_threshold_is_an_outlier` in
+  `tests/test_outlier_detection.py`.
+- This module never iterates: scores are computed once, from the whole
+  segment, with no repeated clipping/re-fitting loop.
+
+### Scientific safety decision
+
+A possible exoplanet transit appears as a *downward* brightness change.
+A generic two-sided sigma-clipping rule would erase exactly the signal
+this project searches for. Consequently:
+
+- Downward (`OutlierDirection.LOW`) detection is **disabled by default**
+  (`OutlierDetectionConfig.lower_threshold=None`).
+- Upward (`OutlierDirection.HIGH`) detection is flagged by default and
+  cannot be disabled, since a positive spike can never be mistaken for a
+  transit.
+- **No cadence is ever removed automatically, regardless of
+  configuration** -- this stage only flags; it never clips, replaces, or
+  excludes.
+- A caller may explicitly pass `--lower-threshold` for diagnostic
+  purposes, but the CLI's report clearly marks it `ENABLED -- may flag
+  transits`, since enabling it can flag possible transits along with
+  genuine artifacts. This is never the project default.
+
+### Segment analysis statuses
+
+A segment's cadences are always preserved and its masks are always
+present and aligned with one entry per cadence, but `robust_score` is
+only computed -- and `high_outlier_mask`/`low_outlier_mask` can only be
+`True` -- when `SegmentOutlierStats.status is OutlierAnalysisStatus.VALID`:
+
+| Status | Condition |
+|---|---|
+| `VALID` | Enough finite normalized-flux values and a usable robust scale; every finite value received a `robust_score`. |
+| `INSUFFICIENT_DATA` | Fewer finite normalized-flux values than `OutlierDetectionConfig.minimum_finite_cadences` (default 5) -- e.g. a one-cadence segment. A median/MAD from too few points is not trustworthy enough to score anything against. |
+| `ZERO_SCALE` | `robust_scale` is not finite, or is at or below `OutlierDetectionConfig.minimum_robust_scale` (default 0.0) -- e.g. a constant or near-constant segment. No division by zero, no invented scores. |
+| `NORMALIZATION_UNAVAILABLE` | The embedded `NormalizedSegment.normalized_flux` is `None` (Phase 3C could not normalize it; see `ReferenceIssue`). There is nothing to analyze. |
+
+A segment with any non-`VALID` status is left with an all-`False`
+statistical-outlier mask, but its embedded `NormalizedSegment` -- every
+TIME, flux, normalized flux, QUALITY, and source index -- is fully
+preserved, and every other segment is still analyzed. One unanalyzable
+segment never blocks the rest of the file.
+
+### Defensive nonfinite normalized-flux handling
+
+Phase 3A's default configuration (`require_finite_flux=True`) already
+removes nonfinite flux before a light curve ever reaches Phase 3D, so a
+nonfinite `normalized_flux` value does not arise under standard
+configuration. It remains explicitly handled for light curves
+quality-filtered with `require_finite_flux=False`, or
+`NormalizedSegment`/`NormalizedLightCurve` objects constructed directly:
+such a position is excluded from `center`/`MAD`, is never classified as
+a high or low statistical outlier, never sets
+`high_outlier_mask`/`low_outlier_mask`, and -- when
+`OutlierDetectionConfig.flag_nonfinite_normalized_flux` is `True` (the
+default) -- gets its own `FlaggedCadence` record with reason
+`NONFINITE_NORMALIZED_FLUX`, distinct from both statistical-outlier
+reasons. Every mask position still exists; nothing is silently omitted
+from the aligned output.
+
+### Edge cases
+
+- **Empty `NormalizedLightCurve`** (zero segments): zero segments out.
+  Not an error.
+- **One-cadence segments**: classified `INSUFFICIENT_DATA` under the
+  default `minimum_finite_cadences=5`, not an error.
+- **A perfectly constant segment**: classified `ZERO_SCALE` (MAD is
+  exactly 0), not an error and not a division by zero.
+
+### Scientific guarantees
+
+- No cadence is ever removed, reordered, or duplicated by this module.
+- The input `NormalizedLightCurve` is never mutated (frozen models,
+  tuple fields).
+- `gaps` and every prior `history` entry (Phase 3A's `ProcessingStep`,
+  Phase 3B's `GapDetectionStep`, Phase 3C's `NormalizationStep`) are
+  carried through unchanged; this phase's own `OutlierDetectionStep` (no
+  timestamp) is appended.
+- The result is a pure function of `(normalized, config)` -- no
+  timestamps, no randomness, no iterative reweighting -- so reruns are
+  reproducible byte-for-byte, verified with `model_dump_json()` equality
+  in both the unit tests and the real-data check below.
+- This module is not detrending, not smoothing, not sector stitching,
+  and not transit detection: it computes one robust score per finite
+  cadence, once, and compares it to a fixed threshold.
+
+### Real-data sanity check
+
+Run `flag-outliers` (default `mast` quality policy, default gap,
+normalization, and outlier-detection config) against the same cached
+SPOC product as the Phase 3A/3B/3C checks (TIC 261136679 / Pi Mensae,
+sector 1, 20,076 raw cadences, 18,264 retained by Phase 3A, 46 Phase
+3B/3C segments, zero invalid-reference segments): of the 46 segments,
+**33** reached `VALID` status and **13** were `INSUFFICIENT_DATA`
+(short segments below `minimum_finite_cadences=5`); no segment hit
+`ZERO_SCALE` or `NORMALIZATION_UNAVAILABLE`. Every `VALID` segment's
+robust center was exactly `1.0` (as expected -- Phase 3C normalizes each
+segment to a median of 1.0), and nonzero robust scales ranged from
+~3.7e-6 to ~7.7e-4 (median ~1.4e-4), reflecting how photometrically
+quiet this bright, stable target is. Using the default configuration
+(`upper_threshold=5.0`, `lower_threshold=None`), exactly **2** cadences
+were flagged as high (positive-spike) outliers, spread across two
+different segments, and -- as guaranteed by the default configuration
+-- **zero** low (downward) outliers were flagged. The most extreme high
+flag had `robust_score ~= 5.49` (source row 3268, TIME ~= 1329.83). The
+single most negative `robust_score` in the whole file was `~= -12.77`
+(source row 17139, TIME ~= 1349.10) -- a clear downward excursion that
+was, as required, **not flagged** under the default configuration,
+since low-side detection is disabled by default. A diagnostic run with
+`lower_threshold=5.0` (same numerical value as the default
+`upper_threshold`, matching this document's own convention above)
+additionally flagged **4** low-side cadences with no change to the
+2 high flags -- reported here only as a diagnostic; the disabled-by-default
+policy remains the project default, and any of those 4 low flags could
+in principle include real transit-like signal rather than pure
+instrumental artifacts. The file's SHA-256, size, and mtime were
+identical before and after; cadence and segment counts matched Phase
+3A/3B/3C exactly; every retained TIME and source index round-tripped
+through the flagged segments in order with no omission or duplication;
+`gaps` and earlier `history` were identical to Phase 3C's own output;
+and two runs on the same input produced byte-identical
+`model_dump_json()` output.
+
 ## Known limitations of this milestone
 
 - The backend Docker image installs only core web-service dependencies.
@@ -848,3 +1059,25 @@ output; and two runs on the same input produced byte-identical
   checksum, so integrity beyond size comparison relies on the locally
   computed SHA-256 sidecar detecting *later* corruption, not validating
   the transfer against an independent source checksum.
+- `1.4826 * MAD` is a Gaussian-consistency convention, not a claim that
+  TESS photometric noise is Gaussian; `robust_score` should be read as a
+  robust, comparable-across-segments unit, not a calibrated probability.
+- A segment's `center`/`MAD` have no protection against a transit (or
+  other astrophysical dip) that occupies a large fraction of that
+  segment, the same inherent limitation Phase 3C's median reference has;
+  the median's ~50% breakdown point makes it robust to a brief transit,
+  not to one spanning most of a short segment.
+- This phase only flags; it never removes, replaces, or invents a value
+  for an outlier. A caller who wants to actually exclude, down-weight,
+  or otherwise act on flagged cadences must do so in a later stage --
+  this phase never decides that for them.
+- Enabling `--lower-threshold` is a diagnostic tool, not a substitute for
+  transit detection: it flags any large downward deviation from a
+  segment's own robust center, including a real transit, an eclipsing
+  binary, or an instrumental dip alike -- it cannot and does not
+  distinguish between them.
+- `minimum_finite_cadences` and `minimum_robust_scale` are fixed,
+  global-default thresholds applied identically to every segment
+  regardless of that segment's own length or noise characteristics; a
+  very long, very quiet segment and a short, noisy one use the same
+  cutoffs unless the caller overrides them per run (not per segment).

@@ -955,3 +955,242 @@ def test_main_normalize_light_curve_defaults_to_mast_policy_and_zero_tolerance(
 def test_main_normalize_light_curve_rejects_unknown_policy_choice() -> None:
     with pytest.raises(SystemExit):
         cli.main(["normalize-light-curve", "sample.fits", "--quality-policy", "aggressive"])
+
+
+def _make_outlier_fits(path: Path) -> Path:
+    """A clean, ten-cadence, single-segment light curve: nine cadences of
+    ordinary jitter around a ~100 baseline, plus one extreme positive
+    spike -- enough finite values for a trustworthy robust scale, and a
+    spike clearly beyond the default upper_threshold=5.0."""
+    primary = fits.PrimaryHDU()
+    primary.header["TELESCOP"] = "TESS"
+    primary.header["TICID"] = 261136679
+    primary.header["SECTOR"] = 1
+    primary.header["CAMERA"] = 2
+    primary.header["CCD"] = 3
+    primary.header["PROCVER"] = "spoc-5.0.10-20200904"
+    primary.header["OBJECT"] = "TIC 261136679"
+
+    flux = np.array(
+        [98.0, 99.0, 100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 5000.0], dtype=np.float64
+    )
+    columns = [
+        fits.Column(name="TIME", format="D", array=np.arange(10, dtype=np.float64)),
+        fits.Column(name="QUALITY", format="J", array=np.zeros(10, dtype=np.int32)),
+        fits.Column(name="PDCSAP_FLUX", format="D", array=flux),
+        fits.Column(name="PDCSAP_FLUX_ERR", format="D", array=np.full(10, 1.0, dtype=np.float64)),
+    ]
+    lc_hdu = fits.BinTableHDU.from_columns(columns, name="LIGHTCURVE")
+    lc_hdu.header["TIMESYS"] = "TDB"
+    lc_hdu.header["TIMEDEL"] = 1.0
+    fits.HDUList([primary, lc_hdu]).writeto(path)
+    return path
+
+
+def test_run_flag_outliers_reports_unanalyzed_segments_by_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gapped fixture's two segments (5 constant-flux cadences, then
+    1 cadence) are ZERO_SCALE and INSUFFICIENT_DATA respectively -- no
+    segment reaches VALID, exercising the "not analyzed" summary."""
+    path = _make_gapped_fits(tmp_path / "gapped-lc.fits")
+
+    exit_code = cli.run_flag_outliers(str(path))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Analyzed segments:        0" in out
+    assert "Segments not analyzed, by status:" in out
+    assert "zero_scale: 1" in out
+    assert "insufficient_data: 1" in out
+
+
+def test_run_flag_outliers_success_prints_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _make_outlier_fits(tmp_path / "outlier-lc.fits")
+
+    exit_code = cli.run_flag_outliers(str(path))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Total cadences:           10" in out
+    assert "Segments:                 1" in out
+    assert "Analyzed segments:        1" in out
+    assert "High (positive) outliers: 1" in out
+    assert "Low (negative) outliers:  0" in out
+    assert "Lower threshold:          disabled (default)" in out
+    assert "The source FITS file was not modified." in out
+    assert "flagging stage only" in out
+
+
+def test_run_flag_outliers_does_not_modify_the_source_file(tmp_path: Path) -> None:
+    path = _make_outlier_fits(tmp_path / "outlier-lc.fits")
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    assert cli.run_flag_outliers(str(path)) == 0
+
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_run_flag_outliers_lower_threshold_disabled_by_default_never_flags_downward_spike(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A downward spike (transit-like) must never be flagged as a low
+    outlier unless --lower-threshold is explicitly passed."""
+    primary = fits.PrimaryHDU()
+    primary.header["TELESCOP"] = "TESS"
+    primary.header["TICID"] = 261136679
+    primary.header["SECTOR"] = 1
+    primary.header["CAMERA"] = 2
+    primary.header["CCD"] = 3
+    primary.header["PROCVER"] = "spoc-5.0.10-20200904"
+    primary.header["OBJECT"] = "TIC 261136679"
+    flux = np.array(
+        [98.0, 99.0, 100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, -5000.0], dtype=np.float64
+    )
+    columns = [
+        fits.Column(name="TIME", format="D", array=np.arange(10, dtype=np.float64)),
+        fits.Column(name="QUALITY", format="J", array=np.zeros(10, dtype=np.int32)),
+        fits.Column(name="PDCSAP_FLUX", format="D", array=flux),
+        fits.Column(name="PDCSAP_FLUX_ERR", format="D", array=np.full(10, 1.0, dtype=np.float64)),
+    ]
+    lc_hdu = fits.BinTableHDU.from_columns(columns, name="LIGHTCURVE")
+    lc_hdu.header["TIMESYS"] = "TDB"
+    lc_hdu.header["TIMEDEL"] = 1.0
+    path = tmp_path / "downward-spike-lc.fits"
+    fits.HDUList([primary, lc_hdu]).writeto(path)
+
+    exit_code = cli.run_flag_outliers(str(path))
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Low (negative) outliers:  0" in out
+
+    exit_code_enabled = cli.run_flag_outliers(str(path), lower_threshold=5.0)
+    out_enabled = capsys.readouterr().out
+    assert exit_code_enabled == 0
+    assert "Low (negative) outliers:  1" in out_enabled
+    assert "ENABLED -- may flag transits" in out_enabled
+
+
+def test_run_flag_outliers_invalid_upper_threshold_returns_exit_code_6(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _make_gapped_fits(tmp_path / "gapped-lc.fits")
+
+    exit_code = cli.run_flag_outliers(str(path), upper_threshold=0.0)
+
+    assert exit_code == 6
+    assert "Invalid configuration" in capsys.readouterr().err
+
+
+def test_run_flag_outliers_invalid_quality_policy_returns_exit_code_6(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _make_gapped_fits(tmp_path / "gapped-lc.fits")
+
+    exit_code = cli.run_flag_outliers(str(path), quality_policy="aggressive")
+
+    assert exit_code == 6
+    assert "Invalid configuration" in capsys.readouterr().err
+
+
+def test_run_flag_outliers_missing_file_returns_exit_code_5(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = cli.run_flag_outliers(str(tmp_path / "nope.fits"))
+
+    assert exit_code == 5
+    assert "FITS file not found" in capsys.readouterr().err
+
+
+def test_run_flag_outliers_invalid_file_returns_exit_code_5(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_path = tmp_path / "bad.fits"
+    bad_path.write_bytes(b"not a fits file")
+
+    exit_code = cli.run_flag_outliers(str(bad_path))
+
+    assert exit_code == 5
+    assert "Invalid FITS file" in capsys.readouterr().err
+
+
+def test_main_dispatches_flag_outliers_with_parsed_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_flag_outliers(fits_path: str, **kwargs: Any) -> int:
+        captured["fits_path"] = fits_path
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(cli, "run_flag_outliers", fake_run_flag_outliers)
+
+    exit_code = cli.main(
+        [
+            "flag-outliers",
+            "data/raw/tess/sample.fits",
+            "--quality-policy",
+            "custom",
+            "--quality-bitmask",
+            "128",
+            "--upper-threshold",
+            "4.0",
+            "--lower-threshold",
+            "4.0",
+            "--minimum-finite-cadences",
+            "3",
+            "--minimum-robust-scale",
+            "0.001",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["fits_path"] == "data/raw/tess/sample.fits"
+    assert captured["kwargs"]["quality_policy"] == "custom"
+    assert captured["kwargs"]["quality_bitmask"] == 128
+    assert captured["kwargs"]["upper_threshold"] == 4.0
+    assert captured["kwargs"]["lower_threshold"] == 4.0
+    assert captured["kwargs"]["minimum_finite_cadences"] == 3
+    assert captured["kwargs"]["minimum_robust_scale"] == 0.001
+
+
+def test_main_flag_outliers_defaults_to_mast_policy_and_disabled_lower_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_flag_outliers(fits_path: str, **kwargs: Any) -> int:
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(cli, "run_flag_outliers", fake_run_flag_outliers)
+
+    assert cli.main(["flag-outliers", "sample.fits"]) == 0
+    assert captured["kwargs"]["quality_policy"] == "mast"
+    assert captured["kwargs"]["upper_threshold"] == 5.0
+    assert captured["kwargs"]["lower_threshold"] is None
+    assert captured["kwargs"]["flag_nonfinite_normalized_flux"] is True
+
+
+def test_main_flag_outliers_no_flag_nonfinite_flag_disables_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_flag_outliers(fits_path: str, **kwargs: Any) -> int:
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr(cli, "run_flag_outliers", fake_run_flag_outliers)
+
+    assert cli.main(["flag-outliers", "sample.fits", "--no-flag-nonfinite-normalized-flux"]) == 0
+    assert captured["kwargs"]["flag_nonfinite_normalized_flux"] is False
+
+
+def test_main_flag_outliers_rejects_unknown_policy_choice() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["flag-outliers", "sample.fits", "--quality-policy", "aggressive"])

@@ -2,6 +2,7 @@
 parsing, and quality-filtering results."""
 
 from enum import StrEnum
+from math import isfinite
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -10,6 +11,7 @@ from app.data.exceptions import (
     InvalidFilterConfigError,
     InvalidGapDetectionConfigError,
     InvalidNormalizationConfigError,
+    InvalidOutlierDetectionConfigError,
 )
 from app.data.quality_flags import (
     POLICY_BITMASKS,
@@ -767,3 +769,327 @@ class NormalizedLightCurve(BaseModel):
     @property
     def cadence_count(self) -> int:
         return sum(segment.segment.cadence_count for segment in self.segments)
+
+
+class OutlierDirection(StrEnum):
+    """Which side of a segment's robust center a flagged cadence fell on."""
+
+    HIGH = "high"
+    """``normalized_flux`` is unusually far *above* the segment's robust
+    center -- a positive spike (cosmic ray, momentum-dump artifact, etc.).
+    Flagged by default."""
+    LOW = "low"
+    """``normalized_flux`` is unusually far *below* the segment's robust
+    center. A real planetary transit is a downward brightness change, so
+    low-side detection is disabled by default -- see
+    ``OutlierDetectionConfig.lower_threshold``."""
+
+
+class OutlierAnalysisStatus(StrEnum):
+    """The outcome of attempting robust per-cadence statistical analysis
+    on one segment. Every status other than ``VALID`` still preserves the
+    segment and produces an all-``False`` statistical-outlier mask --
+    analysis is simply not attempted, never approximated or guessed at.
+    """
+
+    VALID = "valid"
+    """Enough finite normalized-flux values existed and the robust scale
+    was usable; every finite value received a ``robust_score``."""
+    INSUFFICIENT_DATA = "insufficient_data"
+    """Fewer finite normalized-flux values than
+    ``OutlierDetectionConfig.minimum_finite_cadences`` -- e.g. a
+    one-cadence segment. A median/MAD computed from too few points is not
+    trustworthy enough to score anything against."""
+    ZERO_SCALE = "zero_scale"
+    """The segment's robust scale (``1.4826 * MAD``) is not finite, or is
+    at or below ``OutlierDetectionConfig.minimum_robust_scale`` -- e.g. a
+    constant or near-constant segment. Dividing by it would either raise
+    or invent meaningless scores, so none are computed."""
+    NORMALIZATION_UNAVAILABLE = "normalization_unavailable"
+    """The embedded ``NormalizedSegment.normalized_flux`` is ``None``
+    (Phase 3C could not normalize this segment -- see ``ReferenceIssue``).
+    There is nothing to analyze; the Phase 3C reference issue is still
+    visible on the embedded segment."""
+
+
+class OutlierReason(StrEnum):
+    """Why one cadence received a ``FlaggedCadence`` record. Kept
+    disjoint from ``OutlierDirection``/``OutlierAnalysisStatus`` so a
+    missing measurement is never conflated with a statistically unusual
+    one: a nonfinite value means *no usable robust score could be
+    computed*, while a high/low reason means *a score was computed and it
+    exceeded a configured threshold*."""
+
+    HIGH_STATISTICAL_OUTLIER = "high_statistical_outlier"
+    LOW_STATISTICAL_OUTLIER = "low_statistical_outlier"
+    NONFINITE_NORMALIZED_FLUX = "nonfinite_normalized_flux"
+    """``normalized_flux`` at this position is NaN or +/-inf. Never
+    classified as a high or low statistical outlier -- there is no finite
+    value to score. Phase 3A's default configuration
+    (``require_finite_flux=True``) normally prevents this from ever
+    reaching Phase 3D, but defensive handling remains necessary for
+    light curves quality-filtered with ``require_finite_flux=False`` or
+    ``NormalizedSegment``/``NormalizedLightCurve`` objects constructed
+    directly."""
+
+
+class OutlierDetectionConfig(BaseModel):
+    """Configuration for one per-segment robust outlier-flagging run
+    (Phase 3D).
+
+    This stage never removes, replaces, or reorders a cadence -- it only
+    attaches transparent flags that later stages may choose whether to
+    use. Downward (``LOW``) detection is disabled by default
+    (``lower_threshold=None``) because a real planetary transit is itself
+    a downward brightness change: a generic two-sided clipping rule could
+    erase the exact signal this project searches for. A caller may
+    explicitly enable it, but doing so can flag possible transits along
+    with genuine instrumental artifacts.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    upper_threshold: float = 5.0
+    """A finite normalized value is a high outlier when
+    ``robust_score > upper_threshold``. Must be finite and strictly
+    positive. High-side (positive-spike) detection is always active --
+    there is no way to disable it, since it can never mask a transit
+    signal."""
+    lower_threshold: float | None = None
+    """When not ``None``, a finite normalized value is a low outlier when
+    ``robust_score < -lower_threshold``. Must be finite and strictly
+    positive when enabled. **Disabled by default** -- enabling this can
+    flag possible transit signals, since a transit is itself a downward
+    brightness change. Only enable it with a clear understanding that any
+    resulting low-outlier flags may include real astrophysical signal,
+    not just artifacts."""
+    minimum_finite_cadences: int = 5
+    """A segment needs at least this many finite normalized-flux values
+    before its median/MAD are trusted enough to score anything against.
+    Must be a positive integer. Segments with fewer are recorded as
+    ``OutlierAnalysisStatus.INSUFFICIENT_DATA``, not analyzed."""
+    minimum_robust_scale: float = 0.0
+    """A segment's robust scale (``1.4826 * MAD``) must be finite and
+    strictly greater than this value to be trusted for scoring -- the
+    same "invalid unless proven otherwise" convention as
+    ``NormalizationConfig.zero_reference_tolerance``. The default (0.0)
+    only rejects an exactly-zero (perfectly constant) scale; raising it
+    also rejects a near-zero scale from an almost-constant segment. Must
+    be finite and >= 0."""
+    flag_nonfinite_normalized_flux: bool = True
+    """Whether a nonfinite ``normalized_flux`` position gets its own
+    ``FlaggedCadence`` record (reason
+    ``OutlierReason.NONFINITE_NORMALIZED_FLUX``) for traceability. Such
+    positions are never counted as high/low statistical outliers and
+    never set ``high_outlier_mask``/``low_outlier_mask`` either way; this
+    only controls whether they additionally appear in
+    ``flagged_cadences``."""
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if not isfinite(self.upper_threshold) or self.upper_threshold <= 0:
+            raise InvalidOutlierDetectionConfigError(
+                f"upper_threshold must be finite and > 0, got {self.upper_threshold}."
+            )
+        if self.lower_threshold is not None and (
+            not isfinite(self.lower_threshold) or self.lower_threshold <= 0
+        ):
+            raise InvalidOutlierDetectionConfigError(
+                f"lower_threshold must be None or finite and > 0, got {self.lower_threshold}."
+            )
+        if self.minimum_finite_cadences < 1:
+            raise InvalidOutlierDetectionConfigError(
+                "minimum_finite_cadences must be a positive integer, got "
+                f"{self.minimum_finite_cadences}."
+            )
+        if not isfinite(self.minimum_robust_scale) or self.minimum_robust_scale < 0:
+            raise InvalidOutlierDetectionConfigError(
+                f"minimum_robust_scale must be finite and >= 0, got {self.minimum_robust_scale}."
+            )
+        return self
+
+
+class FlaggedCadence(BaseModel):
+    """One cadence that outlier detection flagged, and exactly why.
+
+    Traceable back through every earlier stage: ``segment_number`` and
+    ``position_in_segment`` locate it within its ``LightCurveSegment``;
+    ``filtered_position`` locates it within Phase 3B's retained-cadence
+    arrays; ``source_index`` locates it in the original FITS table.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    segment_number: int
+    position_in_segment: int
+    """0-indexed position within the segment's own arrays."""
+    filtered_position: int
+    """``segment.start_position + position_in_segment`` -- index into the
+    Phase 3B ``FilteredLightCurve``'s retained arrays."""
+    source_index: int
+    """Original FITS row index (``segment.source_indices[position_in_segment]``)."""
+    time: float
+    normalized_flux: float
+    """The Phase 3C normalized flux value at this position, preserved
+    exactly (may itself be NaN or +/-inf when ``reason`` is
+    ``NONFINITE_NORMALIZED_FLUX``)."""
+    robust_score: float | None
+    """``(normalized_flux - center) / robust_scale``. ``None`` exactly
+    when ``reason`` is ``NONFINITE_NORMALIZED_FLUX`` -- no meaningful
+    score exists for a nonfinite input."""
+    direction: OutlierDirection | None
+    """``None`` exactly when ``reason`` is ``NONFINITE_NORMALIZED_FLUX``."""
+    threshold: float | None
+    """The configured threshold this cadence's ``robust_score`` exceeded
+    (``upper_threshold`` or ``lower_threshold``, always positive; compare
+    against ``-threshold`` for a low outlier). ``None`` exactly when
+    ``reason`` is ``NONFINITE_NORMALIZED_FLUX``."""
+    reason: OutlierReason
+
+
+class SegmentOutlierStats(BaseModel):
+    """Per-segment diagnostic record for one outlier-detection attempt."""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: OutlierAnalysisStatus
+    finite_values_analyzed: int
+    """How many of the segment's ``normalized_flux`` values were finite
+    and contributed to ``center``/``raw_mad``. Zero when
+    ``status is NORMALIZATION_UNAVAILABLE``."""
+    center: float | None
+    """``median(finite normalized flux values)``. Recorded whenever at
+    least one finite value exists -- even for ``INSUFFICIENT_DATA`` or
+    ``ZERO_SCALE`` -- so nothing is hidden; ``None`` only when there is no
+    finite value to compute it from at all."""
+    raw_mad: float | None
+    """``median(abs(value - center))``, unscaled. ``None`` under the same
+    condition as ``center``."""
+    robust_scale: float | None
+    """``1.4826 * raw_mad`` -- the Gaussian-consistency scaling
+    convention for MAD (an unbiased estimator of the standard deviation
+    *if* the underlying distribution were exactly Gaussian; TESS
+    photometric noise is not claimed to be). ``None`` under the same
+    condition as ``center``."""
+    high_outlier_count: int
+    low_outlier_count: int
+    """Always 0 when low-side detection is disabled
+    (``OutlierDetectionConfig.lower_threshold is None``)."""
+    nonfinite_flagged_count: int
+    """How many positions received a ``NONFINITE_NORMALIZED_FLUX``
+    record. Always 0 when
+    ``OutlierDetectionConfig.flag_nonfinite_normalized_flux`` is
+    ``False``, regardless of how many nonfinite values are actually
+    present."""
+
+
+class OutlierFlaggedSegment(BaseModel):
+    """One ``NormalizedSegment``'s outlier-flagging result.
+
+    The Phase 3C ``NormalizedSegment`` is embedded, not copied
+    field-by-field, so TIME, original flux, normalized flux, QUALITY,
+    source indices, and every earlier stage's output are preserved by
+    construction. No cadence is ever removed, replaced, or reordered by
+    this model or the module that builds it -- every mask has exactly one
+    entry per cadence in ``normalized.segment``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    normalized: NormalizedSegment
+    outlier_mask: tuple[bool, ...]
+    """``True`` at every position classified as a high **or** low
+    statistical outlier (``high_outlier_mask[i] or (low_outlier_mask or
+    ...)[i]``). Never ``True`` at a nonfinite-flagged position -- that is
+    a distinct, disjoint reason (see ``OutlierReason``). All-``False``
+    when ``stats.status is not VALID``."""
+    high_outlier_mask: tuple[bool, ...]
+    """``True`` exactly where ``robust_score > upper_threshold``.
+    All-``False`` when ``stats.status is not VALID``."""
+    low_outlier_mask: tuple[bool, ...] | None
+    """``True`` exactly where ``robust_score < -lower_threshold``.
+    ``None`` -- not an all-``False`` tuple -- when
+    ``OutlierDetectionConfig.lower_threshold is None``, so "low-side
+    detection was never run" is never confused with "low-side detection
+    ran and found nothing"."""
+    flagged_cadences: tuple[FlaggedCadence, ...]
+    """One record per ``True`` position in ``high_outlier_mask`` or (when
+    enabled) ``low_outlier_mask``, plus one per nonfinite-flagged position
+    (when enabled), in ascending ``position_in_segment`` order."""
+    stats: SegmentOutlierStats
+
+
+class OutlierDetectionStats(BaseModel):
+    """Summary counts for one outlier-detection run."""
+
+    model_config = ConfigDict(frozen=True)
+
+    total_cadences: int
+    segment_count: int
+    analyzed_segment_count: int
+    """Segments with ``stats.status is VALID``."""
+    unanalyzed_by_status: dict[OutlierAnalysisStatus, int]
+    """Per-status counts of segments that were *not* ``VALID`` (so
+    ``OutlierAnalysisStatus.VALID`` never appears as a key). Each segment
+    carries exactly one status, so this is a partition: its values sum to
+    exactly ``segment_count - analyzed_segment_count``."""
+    total_high_outliers: int
+    total_low_outliers: int
+    """Always 0 when low-side detection is disabled."""
+    total_nonfinite_flagged: int
+
+
+class OutlierDetectionStep(BaseModel):
+    """One recorded Phase 3D transformation, for end-to-end provenance --
+    the ``ProcessingStep``/``GapDetectionStep``/``NormalizationStep``
+    equivalent for outlier flagging.
+
+    Deliberately carries no wall-clock timestamp: the result stays a pure
+    function of its inputs, so a rerun on the same normalized light curve
+    with the same config is reproducible byte-for-byte."""
+
+    model_config = ConfigDict(frozen=True)
+
+    step: str
+    code_version: str
+    config: OutlierDetectionConfig
+    input_cadences: int
+    input_segment_count: int
+    analyzed_segment_count: int
+    flagged_cadence_count: int
+    """Total ``FlaggedCadence`` records across every segment (high + low +
+    nonfinite, when each is applicable/enabled)."""
+    input_checksum_sha256: str
+    """SHA-256 of the original source FITS file, carried through from the
+    input ``NormalizedLightCurve``'s provenance."""
+
+
+class OutlierFlaggedLightCurve(BaseModel):
+    """A ``NormalizedLightCurve`` with each segment independently
+    analyzed for statistically unusual normalized flux values.
+
+    This is a flagging stage, not a removal stage: every cadence from the
+    input is present in exactly one ``OutlierFlaggedSegment``, in the
+    same order, with the same TIME/flux/normalized-flux/QUALITY/source
+    index values -- nothing is deleted, replaced, interpolated, or
+    reordered. ``gaps`` is carried through unchanged. ``history`` carries
+    forward every prior processing step (Phase 3A's ``ProcessingStep``,
+    Phase 3B's ``GapDetectionStep``, Phase 3C's ``NormalizationStep``)
+    plus this phase's own ``OutlierDetectionStep``, so full provenance
+    survives outlier flagging."""
+
+    model_config = ConfigDict(frozen=True)
+
+    segments: tuple[OutlierFlaggedSegment, ...]
+    gaps: tuple[DetectedGap, ...]
+    stats: OutlierDetectionStats
+    flux_column: str
+    provenance: FileProvenance
+    metadata: FitsMetadata
+    history: tuple[
+        ProcessingStep | GapDetectionStep | NormalizationStep | OutlierDetectionStep, ...
+    ]
+
+    @property
+    def cadence_count(self) -> int:
+        return sum(segment.normalized.segment.cadence_count for segment in self.segments)
