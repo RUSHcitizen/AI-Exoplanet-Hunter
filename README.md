@@ -337,9 +337,28 @@ pre-commit install
 
 ## Continuous integration
 
-Every push and pull request runs `.github/workflows/ci.yml`, which lints,
-type-checks, tests, and (for the frontend) builds both the backend and
-frontend independently.
+Every push to `master` and every pull request runs
+`.github/workflows/ci.yml`, which lints, type-checks, tests, and (for the
+frontend) builds both the backend and frontend independently.
+
+The backend suite runs in three tiers, so a check never passes by
+silently skipping:
+
+| Tier | Selected by | Needs |
+|---|---|---|
+| default | `pytest` | nothing — runs on a fresh clone and in CI |
+| `realdata` | `pytest -m realdata` | the cached Pi Mensae SPOC product in `data/` |
+| `live` | `pytest -m live` | network access to MAST |
+
+Tests that assert the exact measured values recorded in
+[`docs/architecture.md`](docs/architecture.md) need the real cached FITS
+file, which is gitignored and therefore absent in CI. Those are marked
+`realdata` and skip with instructions for fetching the file. The
+structural behavior of the same code paths — response contract, segment
+and gap alignment, provenance chain, determinism, source-file
+immutability, and the guarantee that low-side outlier detection stays
+disabled — is covered against a synthetic multi-segment fixture
+(`backend/tests/conftest.py`) and runs unconditionally.
 
 ## Development roadmap
 
