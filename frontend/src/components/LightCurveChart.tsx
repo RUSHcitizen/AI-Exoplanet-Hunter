@@ -19,13 +19,15 @@ import type { DemoGap, DemoLightCurveSegment } from "@/lib/api";
  * shows up honestly as blank space, not as an interpolated bridge.
  */
 
-const CHART_HEIGHT = 320;
-const MARGIN = { top: 16, right: 16, bottom: 28, left: 56 };
+const CHART_HEIGHT = 400;
+const MARGIN = { top: 20, right: 16, bottom: 30, left: 64 };
+const Y_TICK_COUNT = 5;
 
 const ANALYZED_POINT_COLOR = "rgba(57, 135, 229, 0.55)";
 const UNANALYZED_POINT_COLOR = "rgba(137, 135, 129, 0.45)";
 const OUTLIER_COLOR = "#ec835a";
 const GAP_LINE_COLOR = "rgba(255, 255, 255, 0.14)";
+const GRID_LINE_COLOR = "rgba(255, 255, 255, 0.06)";
 
 interface Bounds {
   minTime: number;
@@ -42,6 +44,21 @@ interface OutlierMarker {
   robustScore: number | null;
 }
 
+/**
+ * Vertical scale is derived from the **non-outlier** cadences only.
+ *
+ * A handful of instrumental spikes sit orders of magnitude further from
+ * the baseline than the photometric scatter does. Scaling to the full range
+ * would compress every real measurement into a few pixels at the bottom
+ * of the plot -- the light curve, which is the entire point of the
+ * chart, would render as a flat smear. Excluding flagged high outliers
+ * from the domain keeps the actual observations legible.
+ *
+ * Nothing is hidden by this: an outlier outside the resulting domain is
+ * still drawn, pinned to the top edge and explicitly marked as off-scale
+ * (see `offScale` below), and its true value is carried in the marker's
+ * accessible title and in the chart summary.
+ */
 function computeBounds(segments: DemoLightCurveSegment[]): Bounds {
   let minTime = Infinity;
   let maxTime = -Infinity;
@@ -52,7 +69,7 @@ function computeBounds(segments: DemoLightCurveSegment[]): Bounds {
     for (const point of segment.points) {
       if (point.time < minTime) minTime = point.time;
       if (point.time > maxTime) maxTime = point.time;
-      if (point.normalized_flux !== null) {
+      if (point.normalized_flux !== null && !point.is_high_outlier) {
         if (point.normalized_flux < minFlux) minFlux = point.normalized_flux;
         if (point.normalized_flux > maxFlux) maxFlux = point.normalized_flux;
       }
@@ -63,12 +80,25 @@ function computeBounds(segments: DemoLightCurveSegment[]): Bounds {
     minTime = 0;
     maxTime = 1;
   }
+  // Every cadence was flagged, or none carried a normalized value: fall
+  // back to a symmetric window around the normalized baseline of 1.0
+  // rather than rendering an empty or infinite axis.
   if (!Number.isFinite(minFlux) || !Number.isFinite(maxFlux)) {
     minFlux = 0.99;
     maxFlux = 1.01;
   }
-  const padding = (maxFlux - minFlux) * 0.1 || 0.0005;
+  const padding = (maxFlux - minFlux) * 0.12 || 0.0005;
   return { minTime, maxTime, minFlux: minFlux - padding, maxFlux: maxFlux + padding };
+}
+
+/** Evenly spaced flux values spanning the domain, for gridlines and labels. */
+function fluxTicks(bounds: Bounds): number[] {
+  const span = bounds.maxFlux - bounds.minFlux;
+  if (!(span > 0)) return [bounds.minFlux];
+  return Array.from(
+    { length: Y_TICK_COUNT },
+    (_, i) => bounds.minFlux + (span * i) / (Y_TICK_COUNT - 1),
+  );
 }
 
 function collectOutliers(segments: DemoLightCurveSegment[]): OutlierMarker[] {
@@ -113,6 +143,9 @@ export function LightCurveChart({
 
   const bounds = useMemo(() => computeBounds(segments), [segments]);
   const outliers = useMemo(() => collectOutliers(segments), [segments]);
+  const ticks = useMemo(() => fluxTicks(bounds), [bounds]);
+  const offScaleCount = outliers.filter((o) => o.flux > bounds.maxFlux).length;
+  const maxOutlierFlux = outliers.reduce((max, o) => (o.flux > max ? o.flux : max), -Infinity);
   const totalPoints = useMemo(
     () => segments.reduce((sum, segment) => sum + segment.points.length, 0),
     [segments],
@@ -170,6 +203,20 @@ export function LightCurveChart({
           width={width}
           height={CHART_HEIGHT}
         >
+          {/* Horizontal gridlines at each labelled flux tick, so a reader can
+              judge the depth of a variation instead of only its shape. */}
+          {ticks.map((tick) => (
+            <line
+              key={`grid-${tick}`}
+              x1={MARGIN.left}
+              y1={yFor(tick)}
+              x2={width - MARGIN.right}
+              y2={yFor(tick)}
+              stroke={GRID_LINE_COLOR}
+              strokeWidth={1}
+            />
+          ))}
+
           {/* Axis frame */}
           <line
             x1={MARGIN.left}
@@ -202,15 +249,21 @@ export function LightCurveChart({
             );
           })}
 
-          {/* High-outlier markers: a distinct shape (triangle), not color alone */}
+          {/* High-outlier markers: a distinct shape (triangle), not color alone.
+              An outlier above the plotted range is pinned to the top edge and
+              given a capping bar, so it reads as "off-scale" rather than as a
+              measurement that happens to sit at the axis maximum. */}
           {outliers.map((outlier) => {
             const x = xFor(outlier.time);
-            const y = yFor(outlier.flux);
+            const offScale = outlier.flux > bounds.maxFlux;
+            const y = offScale ? MARGIN.top + 7 : yFor(outlier.flux);
             return (
               <g key={`${outlier.segmentNumber}-${outlier.sourceIndex}`}>
                 <title>
                   {`Statistical high outlier — not a planet candidate. Segment ${outlier.segmentNumber}, `}
-                  {`time ${outlier.time.toFixed(4)} BJD, robust score ${outlier.robustScore?.toFixed(2) ?? "n/a"}.`}
+                  {`time ${outlier.time.toFixed(4)} BJD, normalized flux ${outlier.flux.toFixed(6)}, `}
+                  {`robust score ${outlier.robustScore?.toFixed(2) ?? "n/a"}.`}
+                  {offScale ? " Plotted at the top edge — its value is above the displayed range." : ""}
                 </title>
                 <polygon
                   points={`${x},${y - 6} ${x - 5.5},${y + 4.5} ${x + 5.5},${y + 4.5}`}
@@ -218,23 +271,48 @@ export function LightCurveChart({
                   stroke="var(--page-plane)"
                   strokeWidth={1}
                 />
+                {offScale && (
+                  <line
+                    x1={x - 5.5}
+                    y1={y - 8.5}
+                    x2={x + 5.5}
+                    y2={y - 8.5}
+                    stroke={OUTLIER_COLOR}
+                    strokeWidth={1.5}
+                  />
+                )}
               </g>
             );
           })}
         </svg>
 
-        {/* Axis labels */}
-        <span className="absolute bottom-0 left-14 text-[10px] text-ink-muted">
+        {/* Axis labels. Flux ticks are positioned against the same scale the
+            canvas draws with, so a label can never drift from its gridline. */}
+        {ticks.map((tick) => (
+          <span
+            key={`ylabel-${tick}`}
+            className="absolute text-[10px] tabular-nums text-ink-muted"
+            style={{
+              top: yFor(tick) - 7,
+              left: 0,
+              width: MARGIN.left - 8,
+              textAlign: "right",
+            }}
+          >
+            {tick.toFixed(4)}
+          </span>
+        ))}
+        <span
+          className="absolute text-[10px] uppercase tracking-wider text-ink-muted"
+          style={{ top: 0, left: 0 }}
+        >
+          Norm. flux
+        </span>
+        <span className="absolute bottom-0 text-[10px] tabular-nums text-ink-muted" style={{ left: MARGIN.left }}>
           {bounds.minTime.toFixed(2)} BJD
         </span>
-        <span className="absolute bottom-0 right-4 text-[10px] text-ink-muted">
+        <span className="absolute bottom-0 right-4 text-[10px] tabular-nums text-ink-muted">
           {bounds.maxTime.toFixed(2)} BJD
-        </span>
-        <span className="absolute left-1 top-4 text-[10px] text-ink-muted">
-          {bounds.maxFlux.toFixed(4)}
-        </span>
-        <span className="absolute bottom-7 left-1 text-[10px] text-ink-muted">
-          {bounds.minFlux.toFixed(4)}
         </span>
       </div>
 
@@ -275,7 +353,7 @@ export function LightCurveChart({
         markers) -- these are unusual measurements, not planet candidates. Zero low (downward)
         outliers are marked, since lower-side detection is disabled by default to avoid flagging a
         real transit-like dip. Every point shown is an actual displayed cadence; no downsampling
-        was applied.
+        was applied.{offScaleCount > 0 ? ` The vertical scale is set by the ${(totalPoints - outliers.length).toLocaleString()} un-flagged cadences so the light curve stays legible; ${offScaleCount} outlier${offScaleCount === 1 ? " sits" : "s sit"} above the displayed range and ${offScaleCount === 1 ? "is" : "are"} pinned to the top edge with a capped marker (highest: ${maxOutlierFlux.toFixed(6)}).` : ""}
       </p>
     </div>
   );

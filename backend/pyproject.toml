@@ -99,4 +99,5 @@ addopts = "-ra -q --cov=app --cov-report=term-missing -m \"not live\""
 testpaths = ["tests"]
 markers = [
     "live: manually-invoked test that makes a real network call to MAST (excluded by default; run with `pytest -m live`)",
+    "realdata: asserts a value measured from the cached real Pi Mensae SPOC product; makes no network call, but skips (with instructions) when that gitignored file is absent. Structural coverage of the same code paths runs unconditionally against the synthetic fixture in tests/conftest.py.",
 ]

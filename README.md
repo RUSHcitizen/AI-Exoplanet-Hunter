@@ -251,6 +251,35 @@ runtime FITS download:
 recorded after Step B of the Phase 4B deployment order in
 [`docs/architecture.md`](docs/architecture.md#current-status-phase-4b-public-read-only-deployment)._
 
+**Phase 4C: Cloudflare single-origin deployment** -- complete. The same
+dashboard also deploys to Cloudflare as one Worker with static assets,
+serving the site and the API from a single origin:
+
+```bash
+scripts/build-cloudflare.sh      # provision FITS, run pipeline, export JSON, build site
+cd cloudflare && npx wrangler dev     # preview at http://localhost:8787
+cd cloudflare && npx wrangler deploy  # publish
+```
+
+Cloudflare Workers cannot run the FastAPI backend -- FITS parsing needs
+astropy and numpy -- but it does not need to run at request time. The
+demo API is a pure function of one fixed, checksum-pinned observation, so
+`backend/app/deploy/export_static.py` runs the real Phase 3A-3D pipeline
+once at build time and writes both API payloads as static JSON.
+`backend/tests/test_export_static.py` asserts those files are
+byte-identical to the live FastAPI responses, so what the CDN serves is
+what the backend would have returned. The Python service stays the source
+of truth and remains fully runnable via `make dev`, the CLI, and Docker.
+
+This removes the free-tier cold start entirely, and the light-curve
+payload drops from 3.3 MB to 660 KB over the wire (Cloudflare negotiates
+compression) with an `ETag` that makes a repeat visit a 304. Because the
+API is same-origin with the page, no CORS is involved at all.
+
+See [`docs/deployment-cloudflare.md`](docs/deployment-cloudflare.md) for
+the architecture, build settings, and verification steps. The Vercel +
+Render path is unchanged and still supported.
+
 **Explicitly not added by Phase 4B:** a database, a persistent disk,
 background workers, user accounts, authentication, file uploads, or
 arbitrary-target processing -- the public API surface is exactly the
@@ -337,9 +366,28 @@ pre-commit install
 
 ## Continuous integration
 
-Every push and pull request runs `.github/workflows/ci.yml`, which lints,
-type-checks, tests, and (for the frontend) builds both the backend and
-frontend independently.
+Every push to `master` and every pull request runs
+`.github/workflows/ci.yml`, which lints, type-checks, tests, and (for the
+frontend) builds both the backend and frontend independently.
+
+The backend suite runs in three tiers, so a check never passes by
+silently skipping:
+
+| Tier | Selected by | Needs |
+|---|---|---|
+| default | `pytest` | nothing — runs on a fresh clone and in CI |
+| `realdata` | `pytest -m realdata` | the cached Pi Mensae SPOC product in `data/` |
+| `live` | `pytest -m live` | network access to MAST |
+
+Tests that assert the exact measured values recorded in
+[`docs/architecture.md`](docs/architecture.md) need the real cached FITS
+file, which is gitignored and therefore absent in CI. Those are marked
+`realdata` and skip with instructions for fetching the file. The
+structural behavior of the same code paths — response contract, segment
+and gap alignment, provenance chain, determinism, source-file
+immutability, and the guarantee that low-side outlier detection stays
+disabled — is covered against a synthetic multi-segment fixture
+(`backend/tests/conftest.py`) and runs unconditionally.
 
 ## Development roadmap
 

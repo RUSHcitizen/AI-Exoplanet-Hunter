@@ -1,0 +1,15 @@
+# Cloudflare static-asset headers.
+#
+# A Next.js static export has no server, so the security headers that
+# used to live in next.config.ts's headers() are applied here instead.
+# API responses get the same set from the Worker (cloudflare/worker/index.ts).
+
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+
+# Next.js emits content-hashed filenames under /_next/static, so these
+# can never go stale for a given build.
+/_next/static/*
+  Cache-Control: public, max-age=31536000, immutable
