@@ -4,6 +4,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  # Manual trigger, so a run can be started from the Actions tab without
+  # pushing a commit -- useful for confirming Actions is enabled at all,
+  # and for re-running CI against an unchanged tree.
+  workflow_dispatch:
 
 jobs:
   backend:
@@ -68,3 +72,27 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  cloudflare:
+    name: Cloudflare Worker (typecheck)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: cloudflare/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The Worker serves the deployed API, so a type error here is a
+      # production outage rather than a local inconvenience.
+      - name: Typecheck
+        run: npm run typecheck

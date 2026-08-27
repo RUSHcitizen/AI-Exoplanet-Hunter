@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ai-exoplanet-hunter",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-09-01",
+
+  // The Next.js static export plus the precomputed API payloads, assembled
+  // by scripts/build-cloudflare.sh into cloudflare/dist.
+  //
+  // run_worker_first routes /api/v1/* through the Worker; everything else
+  // is served straight from the asset store by Cloudflare's edge, so the
+  // Worker is not invoked for ordinary page or bundle requests.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "run_worker_first": ["/api/v1/*"]
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

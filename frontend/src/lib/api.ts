@@ -5,8 +5,34 @@
  * bundle (any `NEXT_PUBLIC_*` var is), so it must point somewhere the
  * *browser* can reach -- e.g. `http://localhost:8000` in local dev, even
  * though inside Docker Compose the backend's hostname is `backend`.
+ *
+ * Three cases, in precedence order:
+ *
+ * - `"same-origin"` -- issue relative requests (`/api/v1/...`). Used by
+ *   the Cloudflare deployment, where a Worker serves the API from the
+ *   same host as the static site, so there is no cross-origin hop and
+ *   no CORS involved at all.
+ * - any other non-empty value -- an absolute base URL, used verbatim
+ *   with a trailing slash trimmed so `https://host/` cannot produce a
+ *   double-slashed request path.
+ * - unset -- the documented local-development default.
  */
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+export const SAME_ORIGIN = "same-origin";
+
+const LOCAL_DEV_API_URL = "http://localhost:8000";
+
+function resolveApiBaseUrl(): string {
+  const configured = process.env.NEXT_PUBLIC_API_URL;
+  if (configured === undefined || configured === "") {
+    return LOCAL_DEV_API_URL;
+  }
+  if (configured === SAME_ORIGIN) {
+    return "";
+  }
+  return configured.replace(/\/+$/, "");
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 
 export interface HealthResponse {
   status: string;

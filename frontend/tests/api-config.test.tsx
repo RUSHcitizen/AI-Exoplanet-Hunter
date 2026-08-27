@@ -52,6 +52,39 @@ describe("API base URL configuration", () => {
     expect(fetch).toHaveBeenCalledWith("http://localhost:8000/api/v1/health", expect.anything());
   });
 
+  it("issues same-origin relative requests for the Cloudflare deployment", async () => {
+    process.env[ENV_KEY] = "same-origin";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({}) }) as Response),
+    );
+    const { fetchDemoSummary } = await import("@/lib/api");
+    await fetchDemoSummary();
+    expect(fetch).toHaveBeenCalledWith("/api/v1/demo/pi-mensae", expect.anything());
+  });
+
+  it("trims a trailing slash so the path is never double-slashed", async () => {
+    process.env[ENV_KEY] = "https://api.example.com/";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({}) }) as Response),
+    );
+    const { fetchHealth } = await import("@/lib/api");
+    await fetchHealth();
+    expect(fetch).toHaveBeenCalledWith("https://api.example.com/api/v1/health", expect.anything());
+  });
+
+  it("treats an empty value as unset rather than as same-origin", async () => {
+    process.env[ENV_KEY] = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({}) }) as Response),
+    );
+    const { fetchHealth } = await import("@/lib/api");
+    await fetchHealth();
+    expect(fetch).toHaveBeenCalledWith("http://localhost:8000/api/v1/health", expect.anything());
+  });
+
   it("never issues a request to localhost once a production URL is configured", async () => {
     process.env[ENV_KEY] = "https://ai-exoplanet-hunter-api.onrender.com";
     const fetchMock = vi.fn<typeof fetch>(
