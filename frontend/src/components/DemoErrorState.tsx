@@ -1,3 +1,5 @@
+import { buttonStyles, Card } from "@/components/ui";
+
 /**
  * Shared error/empty-state panel for the demo page -- used whenever the
  * backend is unreachable, the cached FITS file is missing, or the
@@ -17,21 +19,28 @@ export function DemoErrorState({
   onRetry?: () => void;
 }) {
   return (
-    <div
-      role="alert"
-      className="rounded-lg border border-status-critical/40 bg-surface-1 p-5 text-sm"
-    >
-      <p className="font-medium text-status-critical">{title}</p>
-      <p className="mt-2 text-ink-secondary">{message}</p>
-      {onRetry && (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="mt-4 rounded-md border border-white/20 px-3 py-1.5 text-sm font-medium text-ink-primary hover:bg-white/5"
+    <Card className="border-status-critical/35">
+      <div role="alert" className="flex items-start gap-3 p-5 text-sm">
+        <span
+          aria-hidden="true"
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-status-critical/15 text-xs text-status-critical"
         >
-          Retry
-        </button>
-      )}
-    </div>
+          ✕
+        </span>
+        <div className="min-w-0">
+          <p className="font-medium text-status-critical">{title}</p>
+          <p className="mt-1 leading-relaxed text-ink-secondary">{message}</p>
+          <p className="mt-2 text-xs text-ink-muted">
+            No values are shown because none were received — this page never substitutes
+            placeholder data.
+          </p>
+          {onRetry && (
+            <button type="button" onClick={onRetry} className={`${buttonStyles.secondary} mt-4`}>
+              Retry
+            </button>
+          )}
+        </div>
+      </div>
+    </Card>
   );
 }

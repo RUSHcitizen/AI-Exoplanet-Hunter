@@ -11,3 +11,11 @@ import { afterEach } from "vitest";
 afterEach(() => {
   cleanup();
 });
+
+// jsdom has no canvas implementation and logs a "Not implemented" error
+// for every getContext() call. The charts already handle a null context,
+// so return null quietly instead of flooding the test output.
+if (typeof HTMLCanvasElement !== "undefined") {
+  HTMLCanvasElement.prototype.getContext = (() =>
+    null) as unknown as HTMLCanvasElement["getContext"];
+}

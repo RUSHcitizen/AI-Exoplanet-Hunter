@@ -245,8 +245,7 @@ describe("PiMensaeDemoPage", () => {
   it("renders the chart with an accessible label describing separate segments and outliers", async () => {
     mockFetchSuccess();
     render(<PiMensaeDemoPage />);
-    await waitFor(() => expect(screen.getByRole("img")).toBeInTheDocument());
-    const chart = screen.getByRole("img");
+    const chart = await screen.findByRole("img", { name: /^Normalized light curve/ });
     expect(chart.getAttribute("aria-label")).toMatch(/3 independently plotted segments/);
     expect(chart.getAttribute("aria-label")).toMatch(/2 statistical high outliers/);
     expect(chart.getAttribute("aria-label")).toMatch(/not planet candidates/);
@@ -260,6 +259,72 @@ describe("PiMensaeDemoPage", () => {
         screen.getByText("Statistical high outlier — not a planet candidate"),
       ).toBeInTheDocument(),
     );
+  });
+
+  it("shows the backend's provenance statements and decoded quality bits", async () => {
+    mockFetchSuccess();
+    render(<PiMensaeDemoPage />);
+    expect(
+      await screen.findByText("The source FITS file is never modified."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Repeated requests return identical results.")).toBeInTheDocument();
+    // Older backends send only bit counts; the panel still lists them.
+    expect(screen.getByText("value 128")).toBeInTheDocument();
+  });
+
+  it("explains that rejection reasons overlap", async () => {
+    mockFetchSuccess();
+    render(<PiMensaeDemoPage />);
+    expect(await screen.findByText(/these counts overlap/i)).toBeInTheDocument();
+  });
+
+  it("labels literature context as literature, never as a pipeline result", async () => {
+    mockFetchSuccess();
+    render(<PiMensaeDemoPage />);
+    await screen.findByText("The Pi Mensae system");
+    expect(screen.getByText(/None of these numbers were produced by this pipeline/)).toBeInTheDocument();
+    expect(screen.getAllByText("Confirmed planet").length).toBe(2);
+  });
+
+  it("filters the segment table by analysis status", async () => {
+    mockFetchSuccess();
+    render(<PiMensaeDemoPage />);
+    await screen.findByText("Showing 3 of 3 segments");
+    fireEvent.click(screen.getByRole("button", { name: /Not analyzed/ }));
+    expect(screen.getByText("Showing 1 of 3 segments")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Analyzed/ }));
+    expect(screen.getByText("Showing 2 of 3 segments")).toBeInTheDocument();
+  });
+
+  it("zooms the chart when a segment's View button is used, and resets", async () => {
+    mockFetchSuccess();
+    Element.prototype.scrollIntoView = vi.fn();
+    render(<PiMensaeDemoPage />);
+    const reset = await screen.findByRole("button", { name: "Reset zoom" });
+    expect(reset).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Show segment 2 in the light curve" }));
+    expect(screen.getByText(/Currently zoomed to/)).toBeInTheDocument();
+    expect(reset).toBeEnabled();
+    fireEvent.click(reset);
+    expect(screen.queryByText(/Currently zoomed to/)).not.toBeInTheDocument();
+  });
+
+  it("shows a literature disclaimer on the folded view", async () => {
+    mockFetchSuccess();
+    render(<PiMensaeDemoPage />);
+    fireEvent.click(await screen.findByRole("tab", { name: /Folded/ }));
+    expect(screen.getByRole("tab", { name: /Folded/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText(/not a detection/i, { selector: "div" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: /Phase-folded light curve/ })).toBeInTheDocument();
+  });
+
+  it("reports a malformed response as a permanent error without retrying", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ unexpected: true }) }) as Response);
+    vi.stubGlobal("fetch", fetchMock);
+    render(<PiMensaeDemoPage />);
+    expect(await screen.findByText(/Unexpected response from the backend/)).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   describe("public cold-start experience", () => {

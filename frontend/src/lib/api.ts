@@ -56,6 +56,9 @@ export interface DemoIdentity {
   source_checksum_sha256: string;
   flux_column: string;
   pipeline: string | null;
+  /** Added after Phase 4B; optional so an older deployed backend still parses. */
+  camera?: number | null;
+  ccd?: number | null;
 }
 
 export interface DemoRawStats {
@@ -71,6 +74,15 @@ export interface DemoQualityFilterSummary {
   quality_bitmask_hex: string;
   rejection_counts_by_reason: Record<string, number>;
   matched_quality_bit_counts: Record<string, number>;
+  /** Decoded bits (added after Phase 4B; absent from older backends). */
+  matched_quality_bits?: QualityBitDetail[];
+}
+
+export interface QualityBitDetail {
+  bit_value: number;
+  bit_number: number;
+  description: string | null;
+  rejected_cadence_count: number;
 }
 
 export interface DemoSegmentationSummary {
@@ -239,4 +251,44 @@ export function isRetryableApiError(error: unknown): boolean {
     return error.status >= 500;
   }
   return error instanceof ApiError;
+}
+
+/** The backend answered 2xx but the body isn't the expected contract --
+ * e.g. an incompatible deployment. Permanent, so never auto-retried. */
+export class MalformedResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MalformedResponseError";
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** Minimal structural checks on the fields the dashboard relies on. */
+export function assertDemoResponses(
+  summary: unknown,
+  lightCurve: unknown,
+): asserts summary is DemoSummaryResponse {
+  const ok =
+    isRecord(summary) &&
+    isRecord(summary.identity) &&
+    isRecord(summary.raw) &&
+    isRecord(summary.quality_filter) &&
+    isRecord(summary.segmentation) &&
+    isRecord(summary.normalization) &&
+    isRecord(summary.outliers) &&
+    isRecord(summary.provenance) &&
+    Array.isArray(summary.provenance.processing_history) &&
+    Array.isArray(summary.scientific_limitations) &&
+    isRecord(lightCurve) &&
+    Array.isArray(lightCurve.segments) &&
+    Array.isArray(lightCurve.gaps) &&
+    lightCurve.segments.every((s: unknown) => isRecord(s) && Array.isArray(s.points));
+  if (!ok) {
+    throw new MalformedResponseError(
+      "The backend responded, but not with the expected demo data format. The frontend and backend deployments may be out of sync.",
+    );
+  }
 }

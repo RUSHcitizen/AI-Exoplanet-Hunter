@@ -1,8 +1,8 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import MissionControlPage from "@/app/page";
+import OverviewPage from "@/app/page";
 
-describe("MissionControlPage", () => {
+describe("OverviewPage", () => {
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());
   });
@@ -12,18 +12,30 @@ describe("MissionControlPage", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the Mission Control heading and stat tiles", () => {
-    render(<MissionControlPage />);
+  it("introduces the project and links to the observation", () => {
+    vi.mocked(fetch).mockReturnValue(new Promise(() => {}));
+    render(<OverviewPage />);
 
-    expect(screen.getByRole("heading", { name: "Mission Control" })).toBeInTheDocument();
-    expect(screen.getByText("Targets processed")).toBeInTheDocument();
-    expect(screen.getByText("Candidates detected")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(/transiting exoplanets/i);
+    const links = screen.getAllByRole("link", { name: /pi mensae/i });
+    expect(links.length).toBeGreaterThan(0);
+    for (const link of links) expect(link).toHaveAttribute("href", "/demo/pi-mensae");
+  });
+
+  it("separates implemented stages from planned ones and never implies ML results", () => {
+    vi.mocked(fetch).mockReturnValue(new Promise(() => {}));
+    render(<OverviewPage />);
+
+    expect(screen.getByRole("heading", { name: "Complete" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Planned" })).toBeInTheDocument();
+    expect(screen.getByText("Machine-learning classification")).toBeInTheDocument();
+    expect(screen.getByText(/No machine-learning model is part of the pipeline yet/)).toBeInTheDocument();
   });
 
   it("shows an offline status when the backend cannot be reached", async () => {
     vi.mocked(fetch).mockRejectedValue(new Error("network down"));
 
-    render(<MissionControlPage />);
+    render(<OverviewPage />);
 
     await waitFor(() => expect(screen.getByText("Offline")).toBeInTheDocument());
     expect(screen.getByText(/Could not reach the backend API/)).toBeInTheDocument();
@@ -40,7 +52,7 @@ describe("MissionControlPage", () => {
       }),
     } as Response);
 
-    render(<MissionControlPage />);
+    render(<OverviewPage />);
 
     await waitFor(() => expect(screen.getByText("Online")).toBeInTheDocument());
     expect(screen.getByText("Exoplanet Hunter API")).toBeInTheDocument();

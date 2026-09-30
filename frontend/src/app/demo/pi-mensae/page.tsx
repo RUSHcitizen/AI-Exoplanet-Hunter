@@ -1,29 +1,41 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ApiError,
+  assertDemoResponses,
   DemoApiError,
   fetchDemoLightCurve,
   fetchDemoSummary,
   isRetryableApiError,
+  MalformedResponseError,
   type DemoLightCurveResponse,
   type DemoSummaryResponse,
 } from "@/lib/api";
 import { StatTile } from "@/components/StatTile";
-import { DemoHeader } from "@/components/DemoHeader";
+import { ObservationHeader } from "@/components/ObservationHeader";
 import { DemoErrorState } from "@/components/DemoErrorState";
+import { DemoSkeleton, LoadingNotice } from "@/components/DemoStates";
 import { BackendWakingNotice } from "@/components/BackendWakingNotice";
 import { PipelineStageList } from "@/components/PipelineStageList";
-import { LightCurveChart } from "@/components/LightCurveChart";
+import { LightCurveExplorer } from "@/components/LightCurveExplorer";
+import type { TimeDomain } from "@/components/LightCurveChart";
 import {
   NormalizationSummary,
   OutlierSummary,
   QualitySummary,
   SegmentationSummary,
 } from "@/components/PhasePanels";
+import { SegmentTable } from "@/components/SegmentTable";
+import { TargetReference } from "@/components/TargetReference";
 import { ProcessingHistory } from "@/components/ProcessingHistory";
+import { ResultKindLegend } from "@/components/ResultKindLegend";
 import { ScientificLimitations } from "@/components/ScientificLimitations";
+import { SectionNav } from "@/components/SectionNav";
+import { SectionHeader } from "@/components/ui";
+import { formatDuration, formatInt, formatPercent } from "@/lib/format";
+import { robustScatterPpm } from "@/lib/lightcurve";
+import { PI_MEN_C_EPHEMERIS } from "@/lib/reference";
 
 // Bounded auto-retry for the public deployment's cold-start experience:
 // a Render free-tier instance waking from sleep looks like a network
@@ -36,11 +48,23 @@ export const MAX_AUTO_RETRY_MS = 60_000;
 
 type DemoState =
   | { kind: "loading" }
-  | { kind: "waking"; attempt: number }
+  | { kind: "waking"; attempt: number; elapsedMs: number }
   | { kind: "error"; title: string; message: string }
   | { kind: "loaded"; summary: DemoSummaryResponse; lightCurve: DemoLightCurveResponse };
 
+const SECTIONS = [
+  { id: "light-curve", label: "Light curve" },
+  { id: "pipeline", label: "Pipeline" },
+  { id: "phase-detail", label: "Stage detail" },
+  { id: "segments", label: "Segments" },
+  { id: "target", label: "Target" },
+  { id: "provenance", label: "Provenance" },
+];
+
 function describeError(error: unknown): { title: string; message: string } {
+  if (error instanceof MalformedResponseError) {
+    return { title: "Unexpected response from the backend", message: error.message };
+  }
   if (error instanceof DemoApiError) {
     if (error.status === 404) {
       return {
@@ -61,9 +85,18 @@ function describeError(error: unknown): { title: string; message: string } {
   return { title: "Unexpected error", message: "The demo page could not load its data." };
 }
 
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
 export default function PiMensaeDemoPage() {
   const [state, setState] = useState<DemoState>({ kind: "loading" });
   const [retryToken, setRetryToken] = useState(0);
+  const [domain, setDomain] = useState<TimeDomain | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -79,6 +112,7 @@ export default function PiMensaeDemoPage() {
           fetchDemoSummary(),
           fetchDemoLightCurve(),
         ]);
+        assertDemoResponses(summary, lightCurve);
         if (!cancelled) {
           setState({ kind: "loaded", summary, lightCurve });
         }
@@ -88,7 +122,7 @@ export default function PiMensaeDemoPage() {
         }
         const elapsed = Date.now() - startedAt;
         if (isRetryableApiError(error) && elapsed < MAX_AUTO_RETRY_MS) {
-          setState({ kind: "waking", attempt: attemptNumber });
+          setState({ kind: "waking", attempt: attemptNumber, elapsedMs: elapsed });
           await wait(RETRY_INTERVAL_MS);
           if (!cancelled) {
             await attempt(attemptNumber + 1);
@@ -111,124 +145,162 @@ export default function PiMensaeDemoPage() {
     setRetryToken((token) => token + 1);
   }
 
+  const zoomTo = useCallback((start: number, end: number) => {
+    setDomain([start, end]);
+    document.getElementById("light-curve")?.scrollIntoView({
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
+      block: "start",
+    });
+  }, []);
+
+  const derived = useMemo(() => {
+    if (state.kind !== "loaded") return null;
+    const segments = state.lightCurve.segments;
+    const first = segments[0]?.start_time;
+    const last = segments[segments.length - 1]?.end_time;
+    return {
+      baselineDays: first !== undefined && last !== undefined ? last - first : null,
+      scatterPpm: robustScatterPpm(segments),
+    };
+  }, [state]);
+
   return (
-    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-8 px-6 py-12">
-      {state.kind === "loaded" ? (
-        <DemoHeader identity={state.summary.identity} />
-      ) : (
-        <header>
-          <p className="text-xs font-medium uppercase tracking-widest text-ink-muted">
-            AI Exoplanet Hunter
-          </p>
-          <h1 className="mt-1 text-2xl font-semibold text-ink-primary">Pi Mensae Science Preview</h1>
-          <p className="mt-1 text-sm text-ink-muted">TIC 261136679 · TESS Sector 1</p>
-        </header>
-      )}
+    <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-10 px-4 pb-8 pt-8 sm:px-6 sm:pt-10">
+      <ObservationHeader identity={state.kind === "loaded" ? state.summary.identity : undefined} />
 
       {state.kind === "loading" && (
-        <p className="text-sm text-ink-muted" role="status">
-          Loading pipeline results…
-        </p>
+        <div className="flex flex-col gap-6">
+          <LoadingNotice />
+          <DemoSkeleton />
+        </div>
       )}
 
       {state.kind === "waking" && (
-        <BackendWakingNotice attempt={state.attempt} onRetryNow={handleRetry} />
+        <BackendWakingNotice
+          attempt={state.attempt}
+          elapsedMs={state.elapsedMs}
+          maxMs={MAX_AUTO_RETRY_MS}
+          onRetryNow={handleRetry}
+        />
       )}
 
       {state.kind === "error" && (
         <DemoErrorState title={state.title} message={state.message} onRetry={handleRetry} />
       )}
 
-      {state.kind === "loaded" && (
-        <>
-          <PipelineStageList />
+      {state.kind === "loaded" && derived && (
+        <div className="flex animate-fade-in flex-col gap-12">
+          <SectionNav sections={SECTIONS} />
 
-          <section aria-labelledby="summary-heading" className="flex flex-col gap-3">
-            <h2 id="summary-heading" className="text-sm font-medium text-ink-secondary">
-              Summary statistics
-            </h2>
-            <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
-              <StatTile
-                label="Raw cadences"
-                value={state.summary.raw.raw_cadence_count.toLocaleString()}
-                caption="Phase 2B"
-              />
-              <StatTile
-                label="Retained cadences"
-                value={state.summary.quality_filter.retained_cadence_count.toLocaleString()}
-                caption="Phase 3A"
-              />
-              <StatTile
-                label="Rejected cadences"
-                value={state.summary.quality_filter.rejected_cadence_count.toLocaleString()}
-                caption="Phase 3A"
-              />
-              <StatTile
-                label="Segments"
-                value={state.summary.segmentation.segment_count.toLocaleString()}
-                caption="Phase 3B"
-              />
-              <StatTile
-                label="Gaps"
-                value={state.summary.segmentation.gap_count.toLocaleString()}
-                caption="Phase 3B"
-              />
-              <StatTile
-                label="Normalized segments"
-                value={state.summary.normalization.normalized_segment_count.toLocaleString()}
-                caption="Phase 3C"
-              />
-              <StatTile
-                label="High outliers"
-                value={state.summary.outliers.high_outlier_count.toLocaleString()}
-                caption="Phase 3D — not planet candidates"
-              />
-              <StatTile
-                label="Low outliers"
-                value={state.summary.outliers.low_outlier_count.toLocaleString()}
-                caption="Lower-side detection disabled"
-              />
-              <StatTile
-                label="Quality policy"
-                value={state.summary.quality_filter.quality_policy.toUpperCase()}
-                caption="MAST-recommended"
-              />
-              <StatTile
-                label="Quality mask"
-                value={state.summary.quality_filter.quality_bitmask_decimal.toLocaleString()}
-                caption={state.summary.quality_filter.quality_bitmask_hex}
-              />
-            </div>
+          <section aria-label="Key figures" className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <StatTile
+              label="Cadences retained"
+              value={formatInt(state.summary.quality_filter.retained_cadence_count)}
+              caption={`of ${formatInt(state.summary.raw.raw_cadence_count)} raw · ${formatPercent(state.summary.quality_filter.retained_fraction)}`}
+              kind="observed"
+            />
+            <StatTile
+              label="Time baseline"
+              value={derived.baselineDays !== null ? derived.baselineDays.toFixed(1) : "—"}
+              unit="days"
+              caption={`${formatInt(state.summary.segmentation.segment_count)} segments, ${formatInt(state.summary.segmentation.gap_count)} gaps`}
+              kind="calculated"
+            />
+            <StatTile
+              label="Robust scatter per cadence"
+              value={derived.scatterPpm !== null ? formatInt(Math.round(derived.scatterPpm)) : "—"}
+              unit="ppm"
+              caption={`vs. ≈ ${PI_MEN_C_EPHEMERIS.depthPpm} ppm published π Men c transit depth`}
+              kind="calculated"
+            />
+            <StatTile
+              label="High outliers flagged"
+              value={formatInt(state.summary.outliers.high_outlier_count)}
+              caption="Unusual bright points — not planet candidates"
+              kind="calculated"
+            />
           </section>
 
-          <section aria-labelledby="chart-heading" className="flex flex-col gap-3">
-            <h2 id="chart-heading" className="text-sm font-medium text-ink-secondary">
-              Normalized light curve
-            </h2>
-            <div className="rounded-lg border border-white/10 bg-surface-1 p-5">
-              <LightCurveChart
-                segments={state.lightCurve.segments}
-                gaps={state.lightCurve.gaps}
-              />
-            </div>
+          <section id="light-curve" aria-labelledby="chart-heading" className="flex flex-col gap-4">
+            <SectionHeader
+              id="chart-heading"
+              eyebrow="Observation"
+              title="Normalized light curve"
+              description={
+                <>
+                  Brightness of Pi Mensae over {derived.baselineDays !== null ? formatDuration(derived.baselineDays) : "the sector"}{" "}
+                  after Phases 3A–3D, as parts-per-million deviation from each segment&rsquo;s
+                  median. Blank stretches are real gaps in the data, never interpolated.
+                </>
+              }
+            />
+            <LightCurveExplorer
+              segments={state.lightCurve.segments}
+              gaps={state.lightCurve.gaps}
+              cadenceDays={state.summary.segmentation.measured_nominal_cadence_days}
+              ephemeris={PI_MEN_C_EPHEMERIS}
+              domain={domain}
+              onDomainChange={setDomain}
+            />
           </section>
 
-          <section aria-labelledby="phase-detail-heading" className="flex flex-col gap-3">
-            <h2 id="phase-detail-heading" className="text-sm font-medium text-ink-secondary">
-              Phase detail
-            </h2>
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div id="pipeline">
+            <PipelineStageList summary={state.summary} />
+          </div>
+
+          <section id="phase-detail" aria-labelledby="phase-detail-heading" className="flex flex-col gap-4">
+            <SectionHeader
+              id="phase-detail-heading"
+              eyebrow="Stage detail"
+              title="What each stage did"
+              description="Exact counts and configuration reported by the backend for every implemented stage."
+            />
+            <div className="grid grid-cols-1 items-start gap-4 md:grid-cols-2">
               <QualitySummary quality={state.summary.quality_filter} />
-              <SegmentationSummary segmentation={state.summary.segmentation} />
-              <NormalizationSummary normalization={state.summary.normalization} />
-              <OutlierSummary outliers={state.summary.outliers} />
+              <div className="flex flex-col gap-4">
+                <SegmentationSummary segmentation={state.summary.segmentation} />
+                <NormalizationSummary normalization={state.summary.normalization} />
+              </div>
+              <div className="md:col-span-2">
+                <OutlierSummary outliers={state.summary.outliers} />
+              </div>
             </div>
           </section>
 
-          <ProcessingHistory history={state.summary.provenance.processing_history} />
+          <section id="segments" aria-labelledby="segments-heading" className="flex flex-col gap-4">
+            <SectionHeader
+              id="segments-heading"
+              eyebrow="Structure"
+              title="Segments and gaps"
+              description="Contiguous stretches of data found by Phase 3B. Segments shorter than the outlier stage's minimum are kept and plotted but not scored."
+            />
+            <SegmentTable
+              segments={state.lightCurve.segments}
+              gaps={state.lightCurve.gaps}
+              onZoom={zoomTo}
+            />
+          </section>
 
-          <ScientificLimitations limitations={state.summary.scientific_limitations} />
-        </>
+          <div id="target">
+            <TargetReference />
+          </div>
+
+          <section id="provenance" aria-labelledby="provenance-heading" className="flex flex-col gap-4">
+            <SectionHeader
+              id="provenance-heading"
+              eyebrow="Reproducibility"
+              title="Provenance and limitations"
+              description="Every result on this page can be regenerated from the source file below with the same code version and configuration."
+            />
+            <div className="grid gap-4 lg:grid-cols-3">
+              <div className="min-w-0 lg:col-span-2">
+                <ProcessingHistory provenance={state.summary.provenance} />
+              </div>
+              <ResultKindLegend compact />
+            </div>
+            <ScientificLimitations limitations={state.summary.scientific_limitations} />
+          </section>
+        </div>
       )}
     </main>
   );

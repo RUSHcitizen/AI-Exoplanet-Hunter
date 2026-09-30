@@ -2,48 +2,175 @@
 
 /*
  * Mission Control is a fixed-dark interface by design (like an actual
- * mission control room), not a light/dark-adaptive app, so color-scheme
- * is pinned to dark rather than following the OS preference.
- * Palette roles below follow the project's dataviz skill reference.
+ * observatory control room), not a light/dark-adaptive app, so
+ * color-scheme is pinned to dark rather than following the OS preference.
+ *
+ * Token roles:
+ *   page / surface-*   layered neutral planes (page < card < raised)
+ *   ink-*              text only -- never used for data marks
+ *   line-*             hairline borders and chart grid
+ *   accent             interactive affordances (links, focus, primary action)
+ *   series-*           data marks; each role is one entity everywhere it appears
+ *   status-*           reserved for state, always paired with an icon + label
+ *   kind-*             result-provenance tags (observed / calculated / literature / model)
  */
 :root {
   color-scheme: dark;
 
-  --page-plane: #0d0d0d;
-  --surface-1: #1a1a19;
-  --surface-2: #202020;
+  --page-plane: #0a0b0d;
+  --surface-1: #121316;
+  --surface-2: #181a1e;
+  --surface-3: #202227;
 
-  --ink-primary: #ffffff;
+  --ink-primary: #f3f3f1;
   --ink-secondary: #c3c2b7;
-  --ink-muted: #898781;
+  --ink-muted: #8d8c86;
 
-  --border-hairline: rgba(255, 255, 255, 0.1);
+  --line-hairline: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.15);
+  --grid-line: #24262b;
+  --axis-line: #3a3c42;
+  /* Kept for components that still reference the original token name. */
+  --border-hairline: var(--line-hairline);
+
+  --accent: #5598e7;
+  --accent-strong: #256abf;
+  --accent-ink: #9ec5f4;
 
   --status-good: #0ca30c;
   --status-warning: #fab219;
   --status-serious: #ec835a;
   --status-critical: #e66767;
 
+  /* Data series (dataviz reference palette, dark steps). */
   --series-blue: #3987e5;
+  --series-observation: #3987e5;
+  --series-binned: #b7d3f6;
+  --series-outlier: #d95926;
+  --series-reference: #199e70;
+
+  --kind-observed: #6da7ec;
+  --kind-calculated: #c3c2b7;
+  --kind-reference: #3fbf91;
+  --kind-model: #9085e9;
 }
 
 @theme inline {
   --color-page-plane: var(--page-plane);
   --color-surface-1: var(--surface-1);
   --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
   --color-ink-primary: var(--ink-primary);
   --color-ink-secondary: var(--ink-secondary);
   --color-ink-muted: var(--ink-muted);
+  --color-line-hairline: var(--line-hairline);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-ink: var(--accent-ink);
   --color-status-good: var(--status-good);
   --color-status-warning: var(--status-warning);
   --color-status-serious: var(--status-serious);
   --color-status-critical: var(--status-critical);
   --color-series-blue: var(--series-blue);
+  --color-series-observation: var(--series-observation);
+  --color-series-binned: var(--series-binned);
+  --color-series-outlier: var(--series-outlier);
+  --color-series-reference: var(--series-reference);
+  --color-kind-observed: var(--kind-observed);
+  --color-kind-calculated: var(--kind-calculated);
+  --color-kind-reference: var(--kind-reference);
+  --color-kind-model: var(--kind-model);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+}
+
+html {
+  scroll-padding-top: 7rem;
 }
 
 body {
   background: var(--page-plane);
   color: var(--ink-primary);
+  font-feature-settings: "ss01", "cv11";
+}
+
+/* A single, very quiet top light so the page reads as a lit instrument
+   panel rather than a flat void. Deliberately not a gradient wash. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 480px;
+  pointer-events: none;
+  background: radial-gradient(60% 100% at 50% 0%, rgba(85, 152, 231, 0.07), transparent 70%);
+  z-index: 0;
+}
+
+::selection {
+  background: rgba(85, 152, 231, 0.35);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface-2) 0px,
+    var(--surface-3) 120px,
+    var(--surface-2) 240px
+  );
+  background-size: 800px 100%;
+  animation: shimmer 1.6s linear infinite;
+  border-radius: 6px;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 240ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

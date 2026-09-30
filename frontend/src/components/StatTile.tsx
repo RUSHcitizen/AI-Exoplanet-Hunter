@@ -1,24 +1,35 @@
+import type { ReactNode } from "react";
+import { Card, KindTag, type ResultKind } from "@/components/ui";
+
 /**
  * A bare stat tile (headline number, no plot) -- per the dataviz skill,
  * this form needs no legend or hover layer, just a clear label and a
- * value in tabular figures so future real numbers align vertically.
+ * value in proportional figures (tabular only where numbers align).
  */
 export function StatTile({
   label,
   value,
   caption,
+  kind,
+  unit,
 }: {
   label: string;
   value: string;
-  caption?: string;
+  caption?: ReactNode;
+  kind?: ResultKind;
+  unit?: string;
 }) {
   return (
-    <div className="rounded-lg border border-white/10 bg-surface-1 p-5">
-      <p className="text-xs font-medium uppercase tracking-wide text-ink-muted">{label}</p>
-      <p className="mt-2 text-3xl font-semibold text-ink-primary [font-variant-numeric:tabular-nums]">
+    <Card className="flex flex-col gap-1.5 p-4">
+      <div className="flex flex-col-reverse items-start gap-1.5 sm:flex-row sm:justify-between sm:gap-2">
+        <p className="text-xs font-medium text-ink-muted">{label}</p>
+        {kind ? <KindTag kind={kind} /> : null}
+      </div>
+      <p className="text-2xl font-semibold tracking-tight text-ink-primary sm:text-[1.7rem]">
         {value}
+        {unit ? <span className="ml-1 text-sm font-normal text-ink-muted">{unit}</span> : null}
       </p>
-      {caption ? <p className="mt-1 text-xs text-ink-muted">{caption}</p> : null}
-    </div>
+      {caption ? <p className="text-xs leading-relaxed text-ink-muted">{caption}</p> : null}
+    </Card>
   );
 }
