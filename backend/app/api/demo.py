@@ -12,7 +12,7 @@ feeds back into scientific processing.
 import statistics
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from app.core.config import Settings, get_settings
@@ -25,6 +25,7 @@ from app.data.models import (
     OutlierFlaggedSegment,
     ProcessingStep,
 )
+from app.data.quality_flags import QUALITY_BIT_TABLE
 from app.services.demo_pipeline import (
     PI_MENSAE_TARGET_NAME,
     DemoFitsNotFoundError,
@@ -35,6 +36,11 @@ from app.services.demo_pipeline import (
 router = APIRouter(prefix="/demo/pi-mensae", tags=["demo"])
 
 _SECONDS_PER_DAY = 86400.0
+
+_CACHE_CONTROL = "public, max-age=300"
+"""Successful demo responses are a deterministic function of one fixed
+file, so browsers may reuse them briefly (e.g. across a page refresh).
+Error responses are never given this header."""
 
 SCIENTIFIC_LIMITATIONS: tuple[str, ...] = (
     "This dashboard does not identify or confirm planets.",
@@ -97,10 +103,22 @@ class DemoIdentity(BaseModel):
     source_checksum_sha256: str
     flux_column: str
     pipeline: str | None
+    camera: int | None = None
+    ccd: int | None = None
 
 
 class DemoRawStats(BaseModel):
     raw_cadence_count: int
+
+
+class QualityBitDetail(BaseModel):
+    """One TESS ``QUALITY`` bit that caused at least one rejection, with
+    its documented meaning (``app.data.quality_flags.QUALITY_BIT_TABLE``)."""
+
+    bit_value: int
+    bit_number: int
+    description: str | None
+    rejected_cadence_count: int
 
 
 class DemoQualityFilterSummary(BaseModel):
@@ -112,6 +130,7 @@ class DemoQualityFilterSummary(BaseModel):
     quality_bitmask_hex: str
     rejection_counts_by_reason: dict[str, int]
     matched_quality_bit_counts: dict[int, int]
+    matched_quality_bits: tuple[QualityBitDetail, ...] = ()
 
 
 class DemoSegmentationSummary(BaseModel):
@@ -289,6 +308,8 @@ def build_summary_response(result: DemoPipelineResult) -> DemoSummaryResponse:
             source_checksum_sha256=flagged.provenance.source_checksum_sha256,
             flux_column=flagged.flux_column,
             pipeline=flagged.provenance.author,
+            camera=flagged.provenance.camera,
+            ccd=flagged.provenance.ccd,
         ),
         raw=DemoRawStats(raw_cadence_count=filtered.stats.total_cadences),
         quality_filter=DemoQualityFilterSummary(
@@ -302,6 +323,15 @@ def build_summary_response(result: DemoPipelineResult) -> DemoSummaryResponse:
                 reason.value: count for reason, count in filtered.stats.rejected_by_reason.items()
             },
             matched_quality_bit_counts=dict(filtered.stats.rejected_by_quality_bit),
+            matched_quality_bits=tuple(
+                QualityBitDetail(
+                    bit_value=bit_value,
+                    bit_number=bit_value.bit_length(),
+                    description=QUALITY_BIT_TABLE.get(bit_value),
+                    rejected_cadence_count=count,
+                )
+                for bit_value, count in sorted(filtered.stats.rejected_by_quality_bit.items())
+            ),
         ),
         segmentation=DemoSegmentationSummary(
             segment_count=segmented.stats.segment_count,
@@ -440,19 +470,24 @@ def build_light_curve_response(result: DemoPipelineResult) -> DemoLightCurveResp
 
 
 @router.get("", response_model=DemoSummaryResponse)
-def get_demo_summary(fits_path: Path = Depends(get_demo_fits_path)) -> DemoSummaryResponse:
+def get_demo_summary(
+    response: Response, fits_path: Path = Depends(get_demo_fits_path)
+) -> DemoSummaryResponse:
     """Pipeline summary (identity, per-phase statistics, provenance, and
     scientific limitations) for the fixed Pi Mensae demonstration light
     curve. Read-only: performs no writes and accepts no path parameter."""
     result = _load_pipeline_result(fits_path)
+    response.headers["Cache-Control"] = _CACHE_CONTROL
     return build_summary_response(result)
 
 
 @router.get("/light-curve", response_model=DemoLightCurveResponse)
 def get_demo_light_curve(
+    response: Response,
     fits_path: Path = Depends(get_demo_fits_path),
 ) -> DemoLightCurveResponse:
     """Gap-aware, segment-grouped normalized light curve for the fixed
     Pi Mensae demonstration observation, for chart rendering."""
     result = _load_pipeline_result(fits_path)
+    response.headers["Cache-Control"] = _CACHE_CONTROL
     return build_light_curve_response(result)

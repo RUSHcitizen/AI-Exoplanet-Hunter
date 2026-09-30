@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.api.demo import router as demo_router
 from app.api.health import router as health_router
@@ -51,6 +52,11 @@ def create_app(app_settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET"],
         allow_headers=["*"],
     )
+
+    # The demo light-curve response is several megabytes of repetitive
+    # JSON (~20k cadences); gzip cuts it by roughly 80% on the wire, which
+    # matters most on the free-tier public deployment.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     app.include_router(health_router, prefix=resolved_settings.api_v1_prefix)
     app.include_router(health_router)  # unversioned alias for infra probes

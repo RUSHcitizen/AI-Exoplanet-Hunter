@@ -17,6 +17,7 @@ mtime/size (e.g. a test fixture swapped out between requests) always
 invalidates it. Nothing is written to disk.
 """
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,6 +57,11 @@ class DemoPipelineResult:
 
 _CacheKey = tuple[str, int, int]
 _cache: dict[_CacheKey, DemoPipelineResult] = {}
+_cache_lock = threading.Lock()
+"""Serializes cache misses. The dashboard requests the summary and the
+light curve concurrently, and FastAPI runs these sync handlers in a
+thread pool -- without the lock, a cold process would run the whole
+pipeline twice in parallel for the same file."""
 
 
 def run_demo_pipeline(fits_path: Path) -> DemoPipelineResult:
@@ -72,21 +78,25 @@ def run_demo_pipeline(fits_path: Path) -> DemoPipelineResult:
         raise DemoFitsNotFoundError(f"Demo FITS file not found: {fits_path}")
 
     cache_key = _cache_key(fits_path)
-    cached = _cache.get(cache_key)
-    if cached is not None:
-        return cached
+    with _cache_lock:
+        cached = _cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result = _run_uncached(fits_path)
+        _cache[cache_key] = result
+        return result
 
+
+def _run_uncached(fits_path: Path) -> DemoPipelineResult:
     raw = parse_light_curve(fits_path)
     filtered = filter_quality(raw)
     segmented = segment_light_curve(filtered)
     normalized = normalize_light_curve(segmented)
     flagged = flag_outliers(normalized)
 
-    result = DemoPipelineResult(
+    return DemoPipelineResult(
         filtered=filtered, segmented=segmented, normalized=normalized, flagged=flagged
     )
-    _cache[cache_key] = result
-    return result
 
 
 def _cache_key(fits_path: Path) -> _CacheKey:
