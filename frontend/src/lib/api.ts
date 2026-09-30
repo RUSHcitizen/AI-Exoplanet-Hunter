@@ -202,7 +202,10 @@ export class DemoApiError extends ApiError {
 async function fetchDemoJson<T>(path: string): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, { cache: "no-store" });
+    // Demo results are deterministic for one fixed file, and the backend
+    // marks successful responses cacheable for a few minutes (errors are
+    // never cached) -- so let the browser reuse them across refreshes.
+    response = await fetch(`${API_BASE_URL}${path}`, { cache: "default" });
   } catch (cause) {
     throw new ApiError("Could not reach the backend API.", cause);
   }
