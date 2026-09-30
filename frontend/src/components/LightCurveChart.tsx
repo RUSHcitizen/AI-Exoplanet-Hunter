@@ -245,6 +245,8 @@ export function LightCurveChart({
   }
 
   function handlePointerDown(event: React.PointerEvent<SVGSVGElement>) {
+    // A tap on touch screens has no preceding hover, so inspect on press too.
+    handlePointerMove(event);
     if (!onDomainChange || event.button !== 0) return;
     const x = localX(event);
     if (x < box.left || x > box.left + box.width) return;

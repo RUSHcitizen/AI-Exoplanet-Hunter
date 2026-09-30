@@ -260,6 +260,31 @@ See
 for the full deployment architecture, CORS decision, cold-start
 behavior, and rollback procedure.
 
+**Phase 4C: Observation explorer and interface polish** -- complete.
+The dashboard is now an interactive observation explorer with one
+coherent design system, and the API is faster to load:
+
+- Interactive light curve: hover or arrow-key inspection of any cadence,
+  drag/keyboard zoom, per-segment 30-minute median bins, labelled axes
+  in ppm and BTJD (TESS `TIME` is BJD − 2457000).
+- The published π Men c ephemeris (Huang et al. 2018) drawn as
+  *predicted* transit windows, with per-window data coverage and a view
+  folded on the published period -- always labelled as literature, never
+  as a detection.
+- Every value is tagged *Observed*, *Calculated*, or *Literature*
+  (*Model prediction* is reserved until a model exists).
+- Segment/gap tables, decoded TESS quality bits, provenance statements,
+  loading/waking/error states, keyboard and screen-reader support,
+  responsive layouts down to 360 px.
+- Backend: gzip compression (~3 MB light-curve JSON), a lock so a cold
+  process never runs the pipeline twice concurrently, short-lived
+  `Cache-Control` on successful demo responses, and additive
+  `camera`/`ccd`/`matched_quality_bits` fields.
+
+See
+[`docs/architecture.md`](docs/architecture.md#current-status-phase-4c-observation-explorer-and-interface-polish)
+for details. Phase 4C adds no new scientific processing.
+
 ## Prerequisites
 
 - Python 3.12+ (this project uses [`uv`](https://docs.astral.sh/uv/) to
@@ -354,7 +379,8 @@ frontend independently.
    - **3D: robust per-segment outlier flagging** -- done.
 4. Mission Control website.
    - **4A: local Pi Mensae science website preview** -- done.
-   - **4B: public read-only deployment** -- done (this milestone).
+   - **4B: public read-only deployment** -- done.
+   - **4C: observation explorer and interface polish** -- done (this milestone).
 5. Transit-search engine (Box Least Squares + pluggable interface).
 6. Physical property estimation.
 7. Synthetic planetary system generator.

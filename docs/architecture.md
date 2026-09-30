@@ -1365,6 +1365,63 @@ the existing health check.
   default (`Settings.cors_origin_regex` is unset); enabling them for a
   given branch/PR is a deliberate, documented opt-in, not automatic.
 
+## Current status: Phase 4C (Observation explorer and interface polish)
+
+Phase 4C improves how the existing Phase 3A-3D result is presented and
+served. It adds **no new scientific processing**: no detrending, no period
+or transit search, no fitting, and no machine learning.
+
+### Backend changes (additive, backward compatible)
+
+- `GZipMiddleware` (responses over 1 KB). The light-curve response is
+  ~3 MB of JSON uncompressed; gzip removes roughly 80% of that on the
+  wire, which matters most on the free-tier deployment.
+- `run_demo_pipeline` serializes cache misses with a lock. The dashboard
+  requests the summary and the light curve concurrently; previously a
+  cold process ran the full pipeline twice in parallel.
+- Successful demo responses carry `Cache-Control: public, max-age=300`
+  (never error responses).
+- `identity.camera` / `identity.ccd`, and
+  `quality_filter.matched_quality_bits` -- each matched TESS quality bit
+  with its bit number and the documented meaning from
+  `app.data.quality_flags.QUALITY_BIT_TABLE`. The existing
+  `matched_quality_bit_counts` map is unchanged.
+- `tests/test_demo_api_synthetic.py` exercises these (and the 404/422
+  error paths) against a small synthetic FITS file, so they run in CI
+  even though `test_demo_api.py` skips without the cached real file.
+
+### Frontend
+
+- One design system (`globals.css` tokens, `components/ui.tsx`
+  primitives) and an app shell with navigation, 404, and error boundary.
+- The overview page links to the observation and describes implemented
+  vs. planned stages from one shared list (`lib/pipeline.ts`).
+- The light-curve explorer (`LightCurveExplorer`, `LightCurveChart`,
+  `PhaseFoldChart`) adds labelled axes (relative flux in ppm; time in
+  **BTJD = BJD_TDB − 2457000**, the TESS `TIME` convention -- the earlier
+  chart mislabelled this as BJD), hover and keyboard inspection of
+  individual cadences, drag/keyboard zoom, and per-segment 30-minute
+  median bins. Binning never crosses a Phase 3B gap.
+- Segment table (filter/sort, zoom-to-segment), gap table, decoded
+  quality bits, and the backend's provenance statements.
+
+### What is calculated for display vs. taken from the literature
+
+Every displayed value carries one of four tags: *Observed* (read from the
+FITS file), *Calculated* (derived deterministically -- counts, medians,
+bins, the robust per-cadence scatter), *Literature* (published values),
+and *Model prediction* (reserved; nothing uses it because no model
+exists yet).
+
+The **Literature** values live in `frontend/src/lib/reference.ts`: the
+π Men c transit ephemeris from Huang et al. 2018 (P = 6.2679 d,
+T0 = 2458325.5034 BJD_TDB) with an approximate duration/depth, and rounded
+host-star and planet parameters. They are used to draw *predicted*
+transit windows, per-window data coverage, and a view folded on the
+published period. These are visual comparisons with published results,
+explicitly labelled as such in the UI -- they are not detections, and the
+pipeline's scientific-limitations list still applies unchanged.
+
 ## Known limitations of this milestone
 
 - The backend Docker image installs core web-service dependencies plus

@@ -85,14 +85,16 @@ export function SegmentTable({
           type="button"
           onClick={() => setSort({ key, desc: active ? !sort.desc : key !== "segment" })}
           className={cx(
-            "inline-flex items-center gap-1 rounded hover:text-ink-primary",
+            "relative inline-flex items-center rounded hover:text-ink-primary",
             active ? "text-ink-primary" : "text-ink-muted",
           )}
         >
           {label}
-          <span aria-hidden="true" className="w-2 text-[10px]">
-            {active ? (sort.desc ? "↓" : "↑") : ""}
-          </span>
+          {active && (
+            <span aria-hidden="true" className="absolute -right-3 text-[10px]">
+              {sort.desc ? "↓" : "↑"}
+            </span>
+          )}
         </button>
       </th>
     );
@@ -116,7 +118,9 @@ export function SegmentTable({
               )}
             >
               {item.label}
-              <span className="text-ink-muted tabular">{counts[item.id]}</span>
+              <span className={cx("tabular", filter === item.id ? "text-ink-secondary" : "text-ink-muted")}>
+                {counts[item.id]}
+              </span>
             </button>
           ))}
         </div>
