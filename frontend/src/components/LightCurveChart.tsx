@@ -409,9 +409,20 @@ export function LightCurveChart({
             })}
 
             {/* Gap boundary indicators -- a subtle dashed tick, never a connecting line */}
-            {gaps.map((gap) => {
+            {gaps.map((gap, index) => {
               const midpoint = xFor((gap.start_time + gap.end_time) / 2);
               if (midpoint < box.left || midpoint > box.left + box.width) return null;
+              // Declutter: at this zoom, gaps within a few pixels of the
+              // previous one would merge into a solid band. Draw one marker
+              // for the cluster (every gap is still counted in the summary
+              // and listed in the gap table; zooming in separates them).
+              const previous = gaps[index - 1];
+              if (
+                previous &&
+                midpoint - xFor((previous.start_time + previous.end_time) / 2) < 6
+              ) {
+                return null;
+              }
               return (
                 <line
                   key={`${gap.before_segment_number}-${gap.after_segment_number}`}

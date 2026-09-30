@@ -97,4 +97,40 @@ describe("LightCurveChart", () => {
     expect(screen.getByText(/Chart summary:/)).toHaveTextContent("3 independently plotted");
     expect(screen.getByText(/Chart summary:/)).toHaveTextContent("2 gaps");
   });
+
+  it("draws one boundary marker for gaps too close together to distinguish", () => {
+    const clustered: DemoGap[] = [0, 1, 2].map((i) => ({
+      ...GAPS[0],
+      before_segment_number: 10 + i,
+      after_segment_number: 11 + i,
+      start_time: 1.5 + i * 0.0001,
+      end_time: 1.5001 + i * 0.0001,
+    }));
+    render(<LightCurveChart segments={SEGMENTS} gaps={clustered} />);
+    const svg = document.querySelector("svg");
+    expect(svg!.querySelectorAll("line[stroke-dasharray]")).toHaveLength(1);
+    // Every gap is still reported in the text summary.
+    expect(screen.getByText(/Chart summary:/)).toHaveTextContent("3 gaps");
+  });
+
+  it("does not draw outlier markers when they are toggled off", () => {
+    render(<LightCurveChart segments={SEGMENTS} gaps={GAPS} showOutliers={false} />);
+    expect(document.querySelector("svg")!.querySelectorAll("polygon")).toHaveLength(0);
+  });
+
+  it("draws predicted transit windows only when provided", () => {
+    const { rerender } = render(<LightCurveChart segments={SEGMENTS} gaps={GAPS} />);
+    expect(document.querySelectorAll('[data-kind="predicted-transit"]')).toHaveLength(0);
+    rerender(
+      <LightCurveChart
+        segments={SEGMENTS}
+        gaps={GAPS}
+        transits={[
+          { epoch: 0, midTime: 1.002, windowStart: 1.001, windowEnd: 1.003, cadencesInWindow: 2, coverage: 1 },
+        ]}
+      />,
+    );
+    expect(document.querySelectorAll('[data-kind="predicted-transit"]')).toHaveLength(1);
+    expect(screen.getByText(/literature ephemeris, not a detection/)).toBeInTheDocument();
+  });
 });

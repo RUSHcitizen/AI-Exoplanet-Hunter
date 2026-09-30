@@ -24,9 +24,12 @@ export function TransitIllustration() {
             </radialGradient>
           </defs>
           <g transform="translate(180 82)">
+            {/* Far half of the orbit passes behind the star... */}
+            <path d="M -150 0 A 150 16 0 0 1 150 0" fill="none" stroke="rgba(85,152,231,0.3)" strokeWidth="1" />
             <circle r="58" fill="url(#star-limb)" />
-            <ellipse rx="150" ry="14" fill="none" stroke="rgba(85,152,231,0.45)" strokeWidth="1" />
-            <circle cx="-8" cy="12" r="9" fill="#0a0b0d" />
+            {/* ...the near half, with the planet on it, in front. */}
+            <path d="M -150 0 A 150 16 0 0 0 150 0" fill="none" stroke="rgba(85,152,231,0.6)" strokeWidth="1" />
+            <circle cx="-8" cy="15.9" r="8" fill="#0a0b0d" />
           </g>
           <g transform="translate(0 168)">
             <line x1="0" x2="360" y1="40" y2="40" stroke="#24262b" />
